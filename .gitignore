@@ -2,3 +2,5 @@ data/
 raw/
 models/
 old_deepsv/
+__pycache__/
+*.pyc
