@@ -9,5 +9,3 @@ scipy>=1.11.0
 matplotlib>=3.7.0
 tqdm>=4.65.0
 transformers>=4.30.0
-umap-learn>=0.5.3
-
