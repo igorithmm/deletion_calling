@@ -18,7 +18,7 @@ echo "--- STEP 1: Generating Balanced Data (Small, Medium, Large) ---"
 python scripts/generate_image_tensor_dataset.py generate \
     --bam "$BAM" --vcf "$VCF" --fasta "$FASTA" --output "$OUT_ROOT" \
     --sample "$SAMPLE" --size "small" --device "$DEVICE" \
-    --exclude-sex --balance --cache-refined "data/refine_cache.json"
+    --exclude-sex --balance
 
 echo "--- STEP 2: PCA Fitting ---"
 python scripts/generate_image_tensor_dataset.py pca \

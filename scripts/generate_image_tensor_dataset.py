@@ -21,7 +21,6 @@ Workflow:
 import argparse
 import logging
 import sys
-import json
 from pathlib import Path
 from typing import List, Tuple, Dict
 from tqdm import tqdm
@@ -184,7 +183,6 @@ def main():
     gen.add_argument("--device", default="cpu")
     gen.add_argument("--exclude-sex", action="store_true", help="Exclude chromosomes X and Y")
     gen.add_argument("--balance", action="store_true", help="Balance non-deletion windows to match deletion windows")
-    gen.add_argument("--cache-refined", help="Path to JSON file to cache refined coordinates")
 
     pca_cmd = sub.add_parser("pca", help="Fit PCA and compress context")
     pca_cmd.add_argument("--dataset", required=True)
@@ -220,47 +218,13 @@ def main():
             del_variants = [v for v in del_variants if v.chrom not in sex_chroms]
             logger.info(f"Excluded {initial_count - len(del_variants)} sex chromosome variants.")
 
-        # Load cache if provided
-        cache = {}
-        if args.cache_refined:
-            cache_path = Path(args.cache_refined)
-            if cache_path.exists():
-                try:
-                    with open(cache_path, "r") as f:
-                        cache = json.load(f)
-                    logger.info("Loaded %d refined coordinates from cache.", len(cache))
-                except Exception as e:
-                    logger.warning("Failed to load cache: %s", e)
-
         with BAMHandler(args.bam) as bam:
             # ... boundaries ...
             refined = []
-            new_cache_entries = 0
             for v in tqdm(del_variants, desc="Refining boundaries"):
-                cache_key = f"{v.chrom}:{v.start}-{v.end}"
-                if cache_key in cache:
-                    # Use cached version
-                    c_start, c_end = cache[cache_key]
-                    refined.append(Variant(v.chrom, c_start, c_end, v.sv_type))
-                else:
-                    # Perform refinement
-                    try: 
-                        rv = refiner.refine_boundaries(bam, v)
-                        refined.append(rv)
-                        cache[cache_key] = [rv.start, rv.end]
-                        new_cache_entries += 1
-                    except: 
-                        refined.append(v)
+                try: refined.append(refiner.refine_boundaries(bam, v))
+                except: refined.append(v)
             del_variants = refined
-            
-            # Save cache if updated
-            if args.cache_refined and new_cache_entries > 0:
-                try:
-                    with open(args.cache_refined, "w") as f:
-                        json.dump(cache, f, indent=2)
-                    logger.info("Saved %d new entries to cache.", new_cache_entries)
-                except Exception as e:
-                    logger.error("Failed to save cache: %s", e)
 
         non_del_variants = vcf_handler.get_non_deletion_regions(del_variants, "up") + vcf_handler.get_non_deletion_regions(del_variants, "down")
 
