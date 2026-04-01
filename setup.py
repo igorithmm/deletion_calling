@@ -30,6 +30,7 @@ setup(
         "umap-learn>=0.5.3",
         "joblib>=1.3.0",
         "huggingface-hub>=0.16.0",
+        "einops>=0.6.1",
     ],
     entry_points={
         "console_scripts": [

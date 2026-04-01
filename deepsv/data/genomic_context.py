@@ -114,6 +114,10 @@ class DNABERT2Embedder:
         # Force non-zero dropout to bypass Triton Flash Attention in bert_layers.py
         config.attention_probs_dropout_prob = 0.1
         
+        # FIX: DNABERT-2 custom modeling code expects pad_token_id to be in the config
+        if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+            config.pad_token_id = self.tokenizer.pad_token_id
+        
         self.model = AutoModel.from_pretrained(
             resolved_path, config=config, trust_remote_code=True
         )

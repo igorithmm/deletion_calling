@@ -76,8 +76,12 @@ class ImageTensorDataset(Dataset):
 # Helpers
 def get_chrom_from_pt_filename(filename: str) -> str:
     parts = filename.replace(".pt", "").split("_")
-    if filename.startswith("del_"): return parts[1]
-    elif filename.startswith("non_del_"): return parts[2]
+    if "_non_del_" in filename:
+        # Example: NA12878_non_del_10_... -> parts[3] is chrom
+        return parts[3]
+    elif "_del_" in filename:
+        # Example: NA12878_del_10_... -> parts[2] is chrom
+        return parts[2]
     return None
 
 def collect_split(del_dir: Path, non_del_dir: Path, chrom_set: set) -> Tuple[List[str], List[int]]:
