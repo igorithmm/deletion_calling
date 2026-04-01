@@ -82,9 +82,9 @@ class CandidateDetector:
             if len(deletion_points) == 0:
                 return None
             
-            # Get boundaries
-            del_left = int(deletion_points[0, 0])
-            del_right = int(deletion_points[-1, 0])
+            # Get boundaries (don't assume sorted order from K-means)
+            del_left = int(deletion_points[:, 0].min())
+            del_right = int(deletion_points[:, 0].max())
             
             # Refine boundaries using original depth data
             depth_dict = dict(zip(positions, depth_data))

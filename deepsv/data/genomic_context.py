@@ -209,7 +209,11 @@ class GenomicContextExtractor:
     def _ensure_ref(self):
         if self._ref is None:
             self._ref = ReferenceGenome(self.fasta_path)
-            self._ref.__enter__()
+            try:
+                self._ref.__enter__()
+            except Exception:
+                self._ref = None
+                raise
 
     def _ensure_embedder(self):
         if self._embedder is None:

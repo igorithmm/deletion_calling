@@ -223,8 +223,10 @@ def main():
             # ... boundaries ...
             refined = []
             for v in tqdm(del_variants, desc="Refining boundaries"):
-                try: refined.append(refiner.refine_boundaries(bam, v))
-                except: refined.append(v)
+                try:
+                    refined.append(refiner.refine_boundaries(bam, v))
+                except Exception:
+                    refined.append(v)
             del_variants = refined
 
         non_del_variants = vcf_handler.get_non_deletion_regions(del_variants, "up") + vcf_handler.get_non_deletion_regions(del_variants, "down")

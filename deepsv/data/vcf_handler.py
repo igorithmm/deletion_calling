@@ -35,8 +35,11 @@ class Variant:
             return DeletionSize.MEDIUM
         elif 700 <= length < 1000:
             return DeletionSize.LARGE
-        else:
+        elif length >= 1000:
             return DeletionSize.VERY_LARGE
+        else:
+            # Sub-50bp variants are not structural variants; classify as SMALL
+            return DeletionSize.SMALL
 
 
 class VCFHandler:
@@ -138,6 +141,8 @@ class VCFHandler:
     
     def _categorize_variants(self, variants: List[Variant]):
         """Categorize variants by size"""
+        # Clear previous categorizations to prevent accumulation
+        self.variants = {size: [] for size in DeletionSize}
         for variant in variants:
             category = variant.size_category
             self.variants[category].append(variant)

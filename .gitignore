@@ -4,3 +4,4 @@ raw/
 old_deepsv/
 __pycache__/
 *.pyc
+*.png

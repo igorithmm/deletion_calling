@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def parse_image_filename(filename: str) -> tuple:
+def parse_image_filename(filename: Path) -> tuple:
     """Parse chromosome and position from image filename"""
     # Expected format: del_chr1_12345_12450.png
     parts = filename.stem.split('_')
@@ -41,7 +41,7 @@ def main():
     # Load model
     logger.info(f"Loading model from {args.model}")
     model = ModernDeletionCNN(num_classes=2)
-    model.load_state_dict(torch.load(args.model, map_location='cpu'))
+    model.load_state_dict(torch.load(args.model, map_location='cpu', weights_only=True))
     
     # Initialize predictor
     predictor = DeletionPredictor(model, threshold=args.threshold)

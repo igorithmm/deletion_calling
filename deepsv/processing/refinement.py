@@ -145,7 +145,14 @@ class BoundaryRefiner:
             # Identify which cluster is the "deletion" (min depth)
             min_idx = np.argmin(cluster_means)
             max_idx = np.argmax(cluster_means)
-            mid_idx = 3 - max_idx - min_idx # The remaining index
+            # Find the remaining ("middle") cluster index safely
+            all_indices = {0, 1, 2}
+            all_indices.discard(min_idx)
+            all_indices.discard(max_idx)
+            if not all_indices:
+                # All clusters have same mean — can't distinguish deletion
+                return variant
+            mid_idx = all_indices.pop()
             
             deletion_cluster = clusters[min_idx]
             

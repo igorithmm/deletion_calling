@@ -242,6 +242,6 @@ class ModelTrainer:
     
     def load_model(self, path: Path):
         """Load model state"""
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
         logger.info(f"Model loaded from {path}")
 

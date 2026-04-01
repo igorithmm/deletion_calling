@@ -112,12 +112,12 @@ class BAMHandler:
             
             if first_op in (4, 5):
                 pos = read.reference_start
-                if start <= pos <= end:
+                if start <= pos < end:
                     clip_counts[pos] += 1
                     
             if last_op in (4, 5) and read.reference_end is not None:
                 pos = read.reference_end - 1
-                if start <= pos <= end:
+                if start <= pos < end:
                     clip_counts[pos] += 1
                     
         return dict(clip_counts)
@@ -150,7 +150,7 @@ class BAMHandler:
         
         pileup_records = []
         for pileup_column in self._bam_file.pileup(chrom, start, end):
-            if start <= pileup_column.pos <= end:
+            if start <= pileup_column.pos < end:
                 for pileup_read in pileup_column.pileups:
                     alignment = pileup_read.alignment
                     if alignment.cigarstring is None or pileup_read.query_position is None:
@@ -306,6 +306,9 @@ class BAMHandler:
                     clip_pos = read.reference_end - 1
                     if start <= clip_pos < end:
                         tensor[CH_CIGAR_SOFT_CLIP, row_idx, clip_pos - start] = 1.0
+
+            if read.reference_end is None:
+                continue
 
             # Determine which columns are active for this read
             read_start_col = max(0, read.reference_start - start)

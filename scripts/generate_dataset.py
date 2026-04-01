@@ -292,7 +292,7 @@ def main():
 
             # 2. Non-deletion up-anchor images
             up_anchors = vcf_handler.get_non_deletion_regions(
-                chrom_variants, anchor_type="up"
+                refined_variants, anchor_type="up"
             )
             random.shuffle(up_anchors)
 
@@ -307,7 +307,7 @@ def main():
 
             # 3. Non-deletion down-anchor images
             down_anchors = vcf_handler.get_non_deletion_regions(
-                chrom_variants, anchor_type="down"
+                refined_variants, anchor_type="down"
             )
             random.shuffle(down_anchors)
 

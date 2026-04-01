@@ -76,12 +76,12 @@ class ImageTensorDataset(Dataset):
 # Helpers
 def get_chrom_from_pt_filename(filename: str) -> str:
     parts = filename.replace(".pt", "").split("_")
-    if "_non_del_" in filename:
-        # Example: NA12878_non_del_10_... -> parts[3] is chrom
-        return parts[3]
-    elif "_del_" in filename:
-        # Example: NA12878_del_10_... -> parts[2] is chrom
-        return parts[2]
+    # Filename: {sample}_{label}_{chrom}_{start}_{end}.pt
+    # The last two parts are always start and end (integers).
+    # The part before them is chrom. Parse from the right to handle
+    # sample names that may contain underscores.
+    if len(parts) >= 4:
+        return parts[-3]  # chrom is always 3rd from the end
     return None
 
 def collect_split(del_dir: Path, non_del_dir: Path, chrom_set: set) -> Tuple[List[str], List[int]]:
@@ -273,14 +273,13 @@ def main():
     if detected_k > 0 and detected_k != args.context_channels:
         args.context_channels = detected_k
 
-    # Set up transforms
+    # Pileup images use a fixed synthetic palette; ImageNet stats are inappropriate.
+    # Images are already (3, 256, 256) in [0,1] from ToTensor() at generation time.
     train_transform = transforms.Compose([
         transforms.Resize((256, 256)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     val_transform = transforms.Compose([
         transforms.Resize((256, 256)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
     train_dataset = ImageTensorDataset(train_paths, train_labels, args.context_channels, transform=train_transform)

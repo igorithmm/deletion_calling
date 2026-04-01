@@ -17,7 +17,7 @@ echo "--- STEP 1: Generating Balanced Data (Small, Medium, Large) ---"
 # Note: --exclude-sex filters X/Y, --balance ensures class equilibrium
 python scripts/generate_image_tensor_dataset.py generate \
     --bam "$BAM" --vcf "$VCF" --fasta "$FASTA" --output "$OUT_ROOT" \
-    --sample "$SAMPLE" --size "small" --device "$DEVICE" \
+    --sample "$SAMPLE" --size "small,medium,large" --device "$DEVICE" \
     --exclude-sex --balance
 
 echo "--- STEP 2: PCA Fitting ---"
