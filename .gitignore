@@ -1,6 +1,6 @@
 /data/
-/raw/
-models/
+raw/
+/models/
 old_deepsv/
 __pycache__/
 *.pyc
