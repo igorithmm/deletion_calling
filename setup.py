@@ -8,8 +8,8 @@ long_description = readme_file.read_text() if readme_file.exists() else ""
 
 setup(
     name="deepsv",
-    version="2.0.0",
-    description="Deep Learning-based Structural Variant Calling for Long Deletions",
+    version="2.5.0",
+    description="Deep Learning-based Structural Variant Calling for Long Deletions (DeepSV 2.5)",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="DeepSV Contributors",
@@ -28,12 +28,19 @@ setup(
         "tqdm>=4.65.0",
         "transformers>=4.30.0",
         "umap-learn>=0.5.3",
+        "joblib>=1.3.0",
+        "huggingface-hub>=0.16.0",
     ],
     entry_points={
         "console_scripts": [
             "deepsv-generate-images=scripts.generate_training_images:main",
             "deepsv-train=scripts.train_model:main",
             "deepsv-call=scripts.call_deletions:main",
+            "deepsv-generate-image-tensor=scripts.generate_image_tensor_dataset:main",
+            "deepsv-train-image-tensor=scripts.train_image_tensor_model:main",
+            "deepsv-generate-alignment-tensor=scripts.generate_tensor_dataset:main",
+            "deepsv-train-alignment-tensor=scripts.train_tensor_model:main",
+            "deepsv-download-dnabert2=scripts.download_dnabert2:main",
         ],
     },
     classifiers=[
