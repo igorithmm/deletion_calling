@@ -52,7 +52,7 @@ def _collect_windows(variants: List[Variant], region_size: int = 50) -> List[Tup
             pos += region_size
     return windows
 
-def _generate_samples(bam_path, fasta_path, windows, label, output_dir, coloring_mode="standard", use_dnabert=True, dnabert_device="cpu", limit=None):
+def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_name="sample", coloring_mode="standard", use_dnabert=True, dnabert_device="cpu", limit=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     ctx_extractor = GenomicContextExtractor(fasta_path, device=dnabert_device) if use_dnabert else None
     image_gen = ImageGenerator(coloring_mode=coloring_mode)
@@ -82,6 +82,7 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, coloring
                     "chrom": chrom,
                     "start": start,
                     "end": end,
+                    "sample": sample_name,
                 }
                 
                 if ctx_extractor:
@@ -90,7 +91,7 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, coloring
                     sample["context_raw"] = torch.from_numpy(raw_emb)
                 
                 label_str = "del" if label == 1 else "non_del"
-                fname = f"{label_str}_{chrom}_{start}_{end}.pt"
+                fname = f"{sample_name}_{label_str}_{chrom}_{start}_{end}.pt"
                 torch.save(sample, output_dir / fname)
                 saved += 1
                 
@@ -244,8 +245,9 @@ def main():
                 logger.info(f"Balanced: Using {len(del_windows)} deletion windows to match {len(non_del_windows)} non-deletions.")
 
         out = Path(args.output)
-        _generate_samples(args.bam, args.fasta, del_windows, 1, out / "deletion", args.coloring_mode, not args.no_dnabert, args.device, args.limit)
-        _generate_samples(args.bam, args.fasta, non_del_windows, 0, out / "non_deletion", args.coloring_mode, not args.no_dnabert, args.device, args.limit)
+        sample_name = args.sample if args.sample else "sample"
+        _generate_samples(args.bam, args.fasta, del_windows, 1, out / "deletion", sample_name, args.coloring_mode, not args.no_dnabert, args.device, args.limit)
+        _generate_samples(args.bam, args.fasta, non_del_windows, 0, out / "non_deletion", sample_name, args.coloring_mode, not args.no_dnabert, args.device, args.limit)
 
     elif args.command == "pca":
         fit_and_apply_pca(Path(args.dataset), args.n_components)
