@@ -1,5 +1,5 @@
-data/
-raw/
+/data/
+/raw/
 models/
 old_deepsv/
 __pycache__/
