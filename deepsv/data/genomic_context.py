@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 DNABERT2_MODEL_ID = "zhihan1996/DNABERT-2-117M"
 DNABERT2_LOCAL_PATH = "/datasets/igorno-genomes_1000/weights/dnabert2"
 
-# Default context window: 50bp center + 1225bp flanks = 2500bp
-DEFAULT_CONTEXT_BP = 2500
+# Default context window: 50bp window + 999bp flanks each side = 2048bp
+DEFAULT_CONTEXT_BP = 2048
+DEFAULT_FLANK_BP = 999
 
 
 class ReferenceGenome:
@@ -61,19 +62,32 @@ class ReferenceGenome:
     def get_extended_window(
         self, chrom: str, center: int, context_bp: int = DEFAULT_CONTEXT_BP
     ) -> str:
-        """Extract an extended reference window centred at *center*.
+        """Extract an extended reference window centred at *center* (legacy)."""
+        half = context_bp // 2
+        return self.get_sequence(chrom, center - half, center + half)
+
+    def get_window_with_flanks(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        flank_bp: int = DEFAULT_FLANK_BP,
+    ) -> str:
+        """Extract sequence: ``flank_bp`` upstream of *start* + window + ``flank_bp`` downstream of *end*.
+
+        Matches DeepSV2.5 spec: 999 bp upstream + 50 bp window + 999 bp downstream = 2048 bp.
 
         Args:
             chrom: Chromosome name.
-            center: Centre position (0-based).
-            context_bp: Total window size in bp (default 2500).
+            start: Window start (0-based, inclusive).
+            end: Window end (0-based, exclusive).
+            flank_bp: Flank size in bp on each side (default 999).
 
         Returns:
-            DNA string of length ≤ context_bp (may be shorter near
-            chromosome boundaries).
+            DNA string. May be shorter than ``flank_bp*2 + (end-start)`` near
+            chromosome boundaries.
         """
-        half = context_bp // 2
-        return self.get_sequence(chrom, center - half, center + half)
+        return self.get_sequence(chrom, start - flank_bp, end + flank_bp)
 
 
 class DNABERT2Embedder:
@@ -195,16 +209,21 @@ class GenomicContextExtractor:
         device: str = "cpu",
         n_components: int = 8,
         context_bp: int = DEFAULT_CONTEXT_BP,
+        flank_bp: int = DEFAULT_FLANK_BP,
     ):
         self.fasta_path = fasta_path
         self.model_id = model_id
         self.device = device
         self.n_components = n_components
         self.context_bp = context_bp
+        self.flank_bp = flank_bp
 
         self._ref: Optional[ReferenceGenome] = None
         self._embedder: Optional[DNABERT2Embedder] = None
         self._pca = None  # sklearn PCA, fitted later
+        # z-score parameters fitted alongside PCA
+        self._scaler_mean: Optional[np.ndarray] = None
+        self._scaler_std: Optional[np.ndarray] = None
 
     def _ensure_ref(self):
         if self._ref is None:
@@ -232,20 +251,26 @@ class GenomicContextExtractor:
     # ------------------------------------------------------------------
 
     def get_raw_embedding(self, chrom: str, center: int) -> np.ndarray:
-        """Extract a 768-dim embedding for a genomic position.
-
-        Args:
-            chrom: Chromosome name.
-            center: Centre of the 50bp window (0-based).
-
-        Returns:
-            np.ndarray of shape (768,), dtype float32.
-        """
+        """Legacy: extract a 768-dim embedding centred at *center*."""
         self._ensure_ref()
         self._ensure_embedder()
         seq = self._ref.get_extended_window(chrom, center, self.context_bp)
         if len(seq) < 10:
-            # Degenerate region — return zeros
+            return np.zeros(768, dtype=np.float32)
+        return self._embedder.embed_sequence(seq)
+
+    def get_raw_embedding_for_window(
+        self, chrom: str, start: int, end: int
+    ) -> np.ndarray:
+        """Extract 768-dim embedding for a window using ``flank_bp`` flanks.
+
+        Sequence layout: [start-flank_bp, end+flank_bp). For default flank=999
+        and a 50bp window this yields 2048 bp, matching the DeepSV2.5 spec.
+        """
+        self._ensure_ref()
+        self._ensure_embedder()
+        seq = self._ref.get_window_with_flanks(chrom, start, end, self.flank_bp)
+        if len(seq) < 10:
             return np.zeros(768, dtype=np.float32)
         return self._embedder.embed_sequence(seq)
 
@@ -254,7 +279,7 @@ class GenomicContextExtractor:
     # ------------------------------------------------------------------
 
     def fit_pca(self, embeddings: np.ndarray):
-        """Fit PCA on training embeddings.
+        """Fit PCA + z-score scaler on training embeddings.
 
         Args:
             embeddings: (N, 768) array of raw DNABERT-2 embeddings.
@@ -267,22 +292,29 @@ class GenomicContextExtractor:
             embeddings.shape[0],
         )
         self._pca = PCA(n_components=self.n_components)
-        self._pca.fit(embeddings)
+        reduced = self._pca.fit_transform(embeddings)
+        self._scaler_mean = reduced.mean(axis=0).astype(np.float32)
+        self._scaler_std = reduced.std(axis=0).astype(np.float32) + 1e-6
         explained = self._pca.explained_variance_ratio_.sum()
         logger.info(
             "PCA fitted. Explained variance: %.2f%% with %d components.",
             explained * 100,
             self.n_components,
         )
+        logger.info(
+            "Scaler stats — mean range [%.3f, %.3f], std range [%.3f, %.3f]",
+            float(self._scaler_mean.min()), float(self._scaler_mean.max()),
+            float(self._scaler_std.min()), float(self._scaler_std.max()),
+        )
 
     def transform_pca(self, embeddings: np.ndarray) -> np.ndarray:
-        """Apply fitted PCA.
+        """Apply fitted PCA followed by z-score normalisation.
 
         Args:
             embeddings: (N, 768) or (768,) array.
 
         Returns:
-            (N, K) or (K,) array with K = n_components.
+            (N, K) or (K,) array with K = n_components, z-scored.
         """
         if self._pca is None:
             raise RuntimeError("PCA not fitted. Call fit_pca() first.")
@@ -290,26 +322,45 @@ class GenomicContextExtractor:
         if single:
             embeddings = embeddings.reshape(1, -1)
         reduced = self._pca.transform(embeddings).astype(np.float32)
+        if self._scaler_mean is not None and self._scaler_std is not None:
+            reduced = (reduced - self._scaler_mean) / self._scaler_std
         return reduced.squeeze(0) if single else reduced
 
     def save_pca(self, path: str):
-        """Persist the fitted PCA model to disk."""
+        """Persist the fitted PCA model + scaler to disk."""
         import joblib
 
         if self._pca is None:
             raise RuntimeError("PCA not fitted.")
-        joblib.dump(self._pca, path)
-        logger.info("PCA model saved to %s", path)
+        joblib.dump(
+            {
+                "pca": self._pca,
+                "scaler_mean": self._scaler_mean,
+                "scaler_std": self._scaler_std,
+            },
+            path,
+        )
+        logger.info("PCA + scaler saved to %s", path)
 
     def load_pca(self, path: str):
-        """Load a previously fitted PCA model from disk."""
+        """Load a previously fitted PCA model (and scaler if present)."""
         import joblib
 
-        self._pca = joblib.load(path)
+        obj = joblib.load(path)
+        if isinstance(obj, dict) and "pca" in obj:
+            self._pca = obj["pca"]
+            self._scaler_mean = obj.get("scaler_mean")
+            self._scaler_std = obj.get("scaler_std")
+        else:
+            # Backward compat: legacy file stored only the PCA object
+            self._pca = obj
+            self._scaler_mean = None
+            self._scaler_std = None
         logger.info(
-            "PCA model loaded from %s (n_components=%d)",
+            "PCA loaded from %s (n_components=%d, scaler=%s)",
             path,
             self._pca.n_components_,
+            "yes" if self._scaler_mean is not None else "no",
         )
 
     # ------------------------------------------------------------------
@@ -317,14 +368,13 @@ class GenomicContextExtractor:
     # ------------------------------------------------------------------
 
     def get_context_vector(self, chrom: str, center: int) -> np.ndarray:
-        """Get the PCA-reduced context vector for a genomic position.
-
-        Args:
-            chrom: Chromosome name.
-            center: Centre of the 50bp window.
-
-        Returns:
-            np.ndarray of shape (K,), dtype float32.
-        """
+        """Legacy: PCA-reduced context vector for a centred position."""
         raw = self.get_raw_embedding(chrom, center)
+        return self.transform_pca(raw)
+
+    def get_context_vector_for_window(
+        self, chrom: str, start: int, end: int
+    ) -> np.ndarray:
+        """PCA-reduced context vector for a window, using ``flank_bp`` flanks."""
+        raw = self.get_raw_embedding_for_window(chrom, start, end)
         return self.transform_pca(raw)

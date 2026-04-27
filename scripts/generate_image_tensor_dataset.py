@@ -14,8 +14,9 @@ Workflow:
   2. For each window:
      a. Extract RGB image using DeepSV2 ImageGenerator.
      b. Convert image to (3, H, W) tensor.
-     c. Extract 2500bp reference context → DNABERT-2 → mean-pool → 768-dim.
-  3. (Optional) Fit PCA on embeddings and transform to K dims.
+     c. Extract 2048bp reference context (999 bp upstream + window + 999 bp downstream)
+        → DNABERT-2 → mean-pool → 768-dim.
+  3. (Optional) Fit PCA on embeddings, z-score, transform to K dims.
   4. Save each sample.
 """
 import argparse
@@ -86,8 +87,7 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_n
                 }
                 
                 if ctx_extractor:
-                    center = (start + end) // 2
-                    raw_emb = ctx_extractor.get_raw_embedding(chrom, center)
+                    raw_emb = ctx_extractor.get_raw_embedding_for_window(chrom, start, end)
                     sample["context_raw"] = torch.from_numpy(raw_emb)
                 
                 label_str = "del" if label == 1 else "non_del"
@@ -108,6 +108,12 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_n
 
 
 def fit_and_apply_pca(dataset_dir: Path, n_components: int = 8):
+    """Fit PCA + z-score scaler on training embeddings, apply to all files.
+
+    Single-pass over each file: collects (path, raw_emb) for files that have a
+    raw embedding, fits PCA on chr1–chr11 subset, then writes back ``context``
+    (PCA + z-scored) and drops ``context_raw`` to save disk.
+    """
     from sklearn.decomposition import PCA
     import joblib
 
@@ -118,19 +124,19 @@ def fit_and_apply_pca(dataset_dir: Path, n_components: int = 8):
 
     logger.info("Collecting raw embeddings from %d files …", len(pt_files))
     train_chroms = {str(c) for c in range(1, 12)}
-    train_embeddings = []
-    
-    all_indices = []
-    # Process in chunks or individually, ensuring we don't keep images in memory
-    for i, f in enumerate(tqdm(pt_files, desc="Collecting embeddings")):
+
+    raw_by_path: Dict[Path, np.ndarray] = {}
+    train_embeddings: List[np.ndarray] = []
+
+    for f in tqdm(pt_files, desc="Collecting embeddings"):
         try:
-            # We load the full file, but don't append it to any list
             data = torch.load(f, weights_only=False)
-            if "context_raw" in data and data.get("chrom") in train_chroms:
-                # We copy the vector and forget the 'data' dict (and its image)
-                train_embeddings.append(data["context_raw"].numpy().copy())
-            
-            # Help garbage collector
+            if "context_raw" not in data:
+                continue
+            raw = data["context_raw"].numpy().astype(np.float32, copy=True)
+            raw_by_path[f] = raw
+            if data.get("chrom") in train_chroms:
+                train_embeddings.append(raw)
             del data
         except Exception as e:
             logger.warning(f"Failed to load {f}: {e}")
@@ -140,29 +146,49 @@ def fit_and_apply_pca(dataset_dir: Path, n_components: int = 8):
         return
 
     all_train = np.stack(train_embeddings)
-    logger.info("Fitting PCA(%d) on %d embeddings...", n_components, len(all_train))
+    logger.info("Fitting PCA(%d) on %d training embeddings …", n_components, len(all_train))
     pca = PCA(n_components=n_components)
-    pca.fit(all_train)
-    joblib.dump(pca, dataset_dir / "pca_model.joblib")
-    
-    # We can clear train_embeddings now to save more space
-    del train_embeddings
-    del all_train
+    train_reduced = pca.fit_transform(all_train).astype(np.float32)
+    explained = pca.explained_variance_ratio_.sum()
+    logger.info("PCA explained variance: %.2f%%", explained * 100)
 
-    logger.info("Applying PCA to all %d files …", len(pt_files))
+    # z-score parameters fitted on training projections only — no test leakage.
+    scaler_mean = train_reduced.mean(axis=0).astype(np.float32)
+    scaler_std = train_reduced.std(axis=0).astype(np.float32) + 1e-6
+    logger.info(
+        "Scaler stats — mean range [%.3f, %.3f], std range [%.3f, %.3f]",
+        float(scaler_mean.min()), float(scaler_mean.max()),
+        float(scaler_std.min()), float(scaler_std.max()),
+    )
+
+    pca_path = dataset_dir / "pca_model.joblib"
+    joblib.dump(
+        {"pca": pca, "scaler_mean": scaler_mean, "scaler_std": scaler_std},
+        pca_path,
+    )
+    logger.info("Saved PCA + scaler to %s", pca_path)
+
+    del train_embeddings, all_train, train_reduced
+
+    logger.info("Applying PCA + z-score to all %d files …", len(pt_files))
+    updated = 0
     for f in tqdm(pt_files, desc="Updating files"):
+        raw = raw_by_path.get(f)
+        if raw is None:
+            continue
         try:
+            reduced = pca.transform(raw.reshape(1, -1)).astype(np.float32).squeeze(0)
+            reduced = (reduced - scaler_mean) / scaler_std
             data = torch.load(f, weights_only=False)
-            if "context_raw" in data:
-                raw = data["context_raw"].numpy().reshape(1, -1)
-                reduced = pca.transform(raw).astype(np.float32).squeeze(0)
-                data["context"] = torch.from_numpy(reduced)
-                torch.save(data, f)
+            data["context"] = torch.from_numpy(reduced.astype(np.float32))
+            data.pop("context_raw", None)  # drop bulky 768-dim vector after compression
+            torch.save(data, f)
+            updated += 1
             del data
         except Exception as e:
             logger.warning(f"Failed to update {f}: {e}")
-            
-    logger.info("Done. All files updated.")
+
+    logger.info("Done. Updated %d / %d files.", updated, len(pt_files))
 
 def main():
     parser = argparse.ArgumentParser(description="Generate image+tensor dataset for DeepSV2.5.")
