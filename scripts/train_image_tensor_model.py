@@ -8,6 +8,7 @@ Usage:
       --epochs 20 --batch-size 32
 """
 import argparse
+import json
 import sys
 import time
 import logging
@@ -241,6 +242,7 @@ def main():
     parser.add_argument("--val-chroms", default="12,13,14,15,16,17,18,19,20,21,22")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None, help="Device (cuda/cpu). Auto-detect if None.")
+    parser.add_argument("--run-name", default=None, help="Tag for the run (used in metrics.json). Default: derived from context-channels.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -266,12 +268,22 @@ def main():
         sys.exit(1)
 
     class_weights = compute_class_weights(train_labels)
-    
-    # Identify actual context components
-    first_sample = torch.load(train_paths[0], weights_only=False)
-    detected_k = first_sample.get("context", torch.zeros(0)).shape[0]
-    if detected_k > 0 and detected_k != args.context_channels:
-        args.context_channels = detected_k
+
+    # Identify actual context components (only if user didn't explicitly disable context).
+    # --context-channels 0 → image-only baseline (3-channel run).
+    if args.context_channels > 0:
+        first_sample = torch.load(train_paths[0], weights_only=False)
+        detected_k = first_sample.get("context", torch.zeros(0)).shape[0]
+        if detected_k == 0:
+            logger.error("No 'context' field in samples but --context-channels=%d. "
+                         "Run the PCA stage first or pass --context-channels 0.", args.context_channels)
+            sys.exit(1)
+        if detected_k != args.context_channels:
+            logger.info("Overriding --context-channels %d → %d (detected from data).",
+                        args.context_channels, detected_k)
+            args.context_channels = detected_k
+    else:
+        logger.info("Running image-only baseline (context_channels=0).")
 
     # Pileup images use a fixed synthetic palette; ImageNet stats are inappropriate.
     # Images are already (3, 256, 256) in [0,1] from ToTensor() at generation time.
@@ -308,6 +320,28 @@ def main():
     best_val_f1 = 0.0
     model_path = output_dir / "best_model.pth"
 
+    run_name = args.run_name or (
+        f"image_only_3ch" if args.context_channels == 0 else f"image_dnabert_{3 + args.context_channels}ch"
+    )
+    metrics_jsonl = output_dir / "metrics.jsonl"
+    metrics_jsonl.write_text("")  # truncate/init
+    run_config = {
+        "run_name": run_name,
+        "context_channels": args.context_channels,
+        "input_channels": 3 + args.context_channels,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "use_sampler": args.use_sampler,
+        "train_chroms": sorted(train_chroms),
+        "val_chroms": sorted(val_chroms),
+        "n_train": len(train_paths),
+        "n_val": len(val_paths),
+        "seed": args.seed,
+    }
+    (output_dir / "config.json").write_text(json.dumps(run_config, indent=2))
+
     total_start = time.time()
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -335,6 +369,30 @@ def main():
             logger.info("  ★ New best model (Weighted-F1=%.4f) saved.", best_val_f1)
 
         update_dashboard(history, val_m, epoch, output_dir)
+
+        epoch_record = {
+            "run_name": run_name,
+            "epoch": epoch,
+            "epoch_seconds": time.time() - epoch_start,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "train_bal_acc": float(train_m["balanced_acc"]),
+            "val_bal_acc": float(val_m["balanced_acc"]),
+            "train_f1_weighted": float(train_m["f1_weighted"]),
+            "val_f1_weighted": float(val_m["f1_weighted"]),
+            "val_f1_macro": float(val_m["f1_macro"]),
+            "val_precision_0": float(val_m["precision"][0]),
+            "val_precision_1": float(val_m["precision"][1]),
+            "val_recall_0": float(val_m["recall"][0]),
+            "val_recall_1": float(val_m["recall"][1]),
+            "val_f1_0": float(val_m["f1"][0]),
+            "val_f1_1": float(val_m["f1"][1]),
+            "val_roc_auc": float(val_m["roc_auc"]),
+            "val_pr_auc": float(val_m["pr_auc"]),
+            "val_confusion_matrix": val_m["confusion_matrix"].tolist(),
+        }
+        with metrics_jsonl.open("a") as fp:
+            fp.write(json.dumps(epoch_record) + "\n")
 
     logger.info("Training complete in %.1f min.", (time.time() - total_start) / 60)
 
