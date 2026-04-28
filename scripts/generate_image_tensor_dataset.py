@@ -56,9 +56,20 @@ def _collect_windows(variants: List[Variant], region_size: int = 50) -> List[Tup
 def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_name="sample", coloring_mode="standard", use_dnabert=True, dnabert_device="cpu", limit=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     ctx_extractor = GenomicContextExtractor(fasta_path, device=dnabert_device) if use_dnabert else None
+
+    # Eagerly initialise the embedder once: surfaces config errors (e.g. the
+    # 'meta tensor' loading bug) before processing any window, instead of
+    # silently failing per-window and producing an empty dataset.
+    if ctx_extractor:
+        try:
+            ctx_extractor._ensure_embedder()
+        except Exception as e:
+            logger.error("Failed to initialise DNABERT-2 embedder: %s", e)
+            raise
+
     image_gen = ImageGenerator(coloring_mode=coloring_mode)
     to_tensor = transforms.ToTensor()
-    
+
     saved = 0
     with BAMHandler(bam_path) as bam:
         for idx, (chrom, start, end) in enumerate(windows):
@@ -66,17 +77,17 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_n
                 break
             if end - start < 5:
                 continue
-            
+
             try:
                 pileup_data = bam.get_pileup_data(chrom, start, end)
                 clipping_data = bam.get_clipping_info(chrom, start, end)
-                
+
                 if not pileup_data:
                     continue
-                    
+
                 image = image_gen.generate_image(pileup_data, clipping_data, start, end - start)
                 img_tensor = to_tensor(image)  # (3, H, W) float32
-                
+
                 sample = {
                     "image": img_tensor,
                     "label": label,
@@ -85,20 +96,26 @@ def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_n
                     "end": end,
                     "sample": sample_name,
                 }
-                
+
                 if ctx_extractor:
                     raw_emb = ctx_extractor.get_raw_embedding_for_window(chrom, start, end)
                     sample["context_raw"] = torch.from_numpy(raw_emb)
-                
+
                 label_str = "del" if label == 1 else "non_del"
                 fname = f"{sample_name}_{label_str}_{chrom}_{start}_{end}.pt"
                 torch.save(sample, output_dir / fname)
                 saved += 1
-                
+
                 if saved % 200 == 0:
                     logger.info("  [%s] Saved %d / %d windows (current: %s:%d-%d)", label_str, saved, len(windows), chrom, start, end)
             except Exception as e:
                 logger.error("Error at %s:%d-%d: %s", chrom, start, end, e)
+                # If the embedder hit a sticky init failure, abort instead of
+                # logging the same error for every remaining window.
+                if ctx_extractor and getattr(ctx_extractor, "_embedder_init_failed", False):
+                    raise RuntimeError(
+                        "DNABERT-2 embedder is in a failed state — aborting."
+                    ) from e
                 
     if ctx_extractor:
         ctx_extractor.close()
