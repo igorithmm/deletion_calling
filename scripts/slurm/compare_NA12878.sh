@@ -112,7 +112,8 @@ else
         --balance \
         --size all \
         --coloring-mode standard \
-        --seed "$SEED"
+        --seed "$SEED" \
+        --dnabert-source hf
     touch "$STAGE1_DONE_MARKER"
     echo "=== Stage 1 done ==="
 fi

@@ -103,19 +103,50 @@ class DNABERT2Embedder:
         self,
         model_id: str = DNABERT2_MODEL_ID,
         device: str = "cpu",
+        source: str = "auto",
     ):
+        """Initialise the DNABERT-2 embedder.
+
+        Args:
+            model_id: HuggingFace repo id (used when ``source`` is "hf" or
+                "auto" with no local copy available).
+            device: Target device for the model after construction.
+            source: Where to load weights from.
+                "auto"  — prefer local copy at ``model_id`` or
+                          ``DNABERT2_LOCAL_PATH`` if either exists, otherwise
+                          fall back to HuggingFace Hub. (Default.)
+                "hf"    — always load from HuggingFace Hub. Useful when the
+                          local copy ships with an outdated ``bert_layers.py``
+                          that triggers ALiBi/meta-tensor errors.
+                "local" — always load from a local path. Raises if no local
+                          copy is available.
+        """
         from transformers import AutoTokenizer, AutoModel
 
-        # Prefer local path if it exists
-        if Path(model_id).exists():
+        if source == "hf":
             resolved_path = model_id
-            logger.info("Loading DNABERT-2 from local path: %s", resolved_path)
-        elif Path(DNABERT2_LOCAL_PATH).exists():
-            resolved_path = DNABERT2_LOCAL_PATH
-            logger.info("Loading DNABERT-2 from default local path: %s", resolved_path)
-        else:
-            resolved_path = model_id
-            logger.info("Loading DNABERT-2 from HuggingFace: %s", resolved_path)
+            logger.info("Loading DNABERT-2 from HuggingFace (forced): %s", resolved_path)
+        elif source == "local":
+            if Path(model_id).exists():
+                resolved_path = model_id
+            elif Path(DNABERT2_LOCAL_PATH).exists():
+                resolved_path = DNABERT2_LOCAL_PATH
+            else:
+                raise FileNotFoundError(
+                    f"source='local' but no local DNABERT-2 weights found at "
+                    f"'{model_id}' or '{DNABERT2_LOCAL_PATH}'."
+                )
+            logger.info("Loading DNABERT-2 from local path (forced): %s", resolved_path)
+        else:  # "auto"
+            if Path(model_id).exists():
+                resolved_path = model_id
+                logger.info("Loading DNABERT-2 from local path: %s", resolved_path)
+            elif Path(DNABERT2_LOCAL_PATH).exists():
+                resolved_path = DNABERT2_LOCAL_PATH
+                logger.info("Loading DNABERT-2 from default local path: %s", resolved_path)
+            else:
+                resolved_path = model_id
+                logger.info("Loading DNABERT-2 from HuggingFace: %s", resolved_path)
 
         logger.info("Loading DNABERT-2 tokenizer …")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -241,6 +272,7 @@ class GenomicContextExtractor:
         n_components: int = 8,
         context_bp: int = DEFAULT_CONTEXT_BP,
         flank_bp: int = DEFAULT_FLANK_BP,
+        source: str = "auto",
     ):
         self.fasta_path = fasta_path
         self.model_id = model_id
@@ -248,6 +280,7 @@ class GenomicContextExtractor:
         self.n_components = n_components
         self.context_bp = context_bp
         self.flank_bp = flank_bp
+        self.source = source
 
         self._ref: Optional[ReferenceGenome] = None
         self._embedder: Optional[DNABERT2Embedder] = None
@@ -279,7 +312,7 @@ class GenomicContextExtractor:
             )
         try:
             self._embedder = DNABERT2Embedder(
-                model_id=self.model_id, device=self.device
+                model_id=self.model_id, device=self.device, source=self.source
             )
         except Exception:
             self._embedder_init_failed = True
