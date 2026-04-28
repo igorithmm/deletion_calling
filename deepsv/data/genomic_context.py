@@ -132,18 +132,27 @@ class DNABERT2Embedder:
         if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
             config.pad_token_id = self.tokenizer.pad_token_id
         
-        # low_cpu_mem_usage=False: avoid meta-tensor loading path. With newer
-        # transformers + accelerate, the default low_cpu_mem_usage=True can
-        # leave buffers on the 'meta' device for DNABERT-2's custom modeling
-        # code, then a subsequent .to(device) fails with
-        #   "Tensor on device meta is not on the expected device cpu!".
-        # Forcing materialisation on CPU first makes .to() reliable.
-        self.model = AutoModel.from_pretrained(
-            resolved_path,
-            config=config,
-            trust_remote_code=True,
-            low_cpu_mem_usage=False,
-        )
+        # DNABERT-2's bert_layers.py constructs ALiBi tensors inside __init__
+        # via torch.arange(...) etc. Those calls inherit the default device.
+        # In recent transformers + accelerate, the default device can be
+        # silently switched to 'meta' during from_pretrained, which causes
+        #   alibi = slopes.unsqueeze(...) * -relative_position
+        # to mix a cpu tensor (slopes) with a meta tensor (relative_position)
+        # and raise:
+        #   "Tensor on device meta is not on the expected device cpu!"
+        #
+        # Forcing the default device to cpu for the duration of construction
+        # ensures every implicit tensor inside the custom modeling code is
+        # created on cpu, regardless of what transformers does globally.
+        # low_cpu_mem_usage=False is also passed as belt-and-braces — it
+        # disables the meta→materialise loading path on the transformers side.
+        with torch.device("cpu"):
+            self.model = AutoModel.from_pretrained(
+                resolved_path,
+                config=config,
+                trust_remote_code=True,
+                low_cpu_mem_usage=False,
+            )
         self.model.eval()
         self.device = torch.device(device)
 
@@ -153,9 +162,10 @@ class DNABERT2Embedder:
         meta_buffers = [n for n, b in self.model.named_buffers() if b.is_meta]
         if meta_params or meta_buffers:
             raise RuntimeError(
-                f"DNABERT-2 still has meta tensors after low_cpu_mem_usage=False: "
+                f"DNABERT-2 still has meta tensors after construction: "
                 f"params={meta_params[:3]}..., buffers={meta_buffers[:3]}... "
-                "Likely a transformers/accelerate version mismatch."
+                "Likely a transformers/accelerate version mismatch — try "
+                "pinning transformers==4.29.2 (the version DNABERT-2 ships with)."
             )
 
         self.model.to(self.device)

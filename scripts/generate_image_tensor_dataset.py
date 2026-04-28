@@ -221,7 +221,10 @@ def main():
     gen.add_argument("--chrom")
     gen.add_argument("--region-size", type=int, default=50)
     gen.add_argument("--max-length", type=int, default=10000)
-    gen.add_argument("--limit", type=int)
+    gen.add_argument("--limit", type=int, help="Cap windows processed per class (post-refinement).")
+    gen.add_argument("--max-variants", type=int, help="Cap deletion variants BEFORE boundary refinement. "
+                                                       "Useful for smoke tests — refinement is the slowest stage.")
+    gen.add_argument("--seed", type=int, default=42, help="Random seed for variant subsampling and class balancing.")
     gen.add_argument("--coloring-mode", choices=["standard", "kmer"], default="standard")
     gen.add_argument("--no-dnabert", action="store_true")
     gen.add_argument("--device", default="cpu")
@@ -262,6 +265,19 @@ def main():
             del_variants = [v for v in del_variants if v.chrom not in sex_chroms]
             logger.info(f"Excluded {initial_count - len(del_variants)} sex chromosome variants.")
 
+        # Subsample variants BEFORE refinement — refinement is O(n) and the
+        # slowest stage, so this controls smoke-test wallclock far more than
+        # --limit (which only caps already-generated windows).
+        if args.max_variants and len(del_variants) > args.max_variants:
+            import random
+            rng = random.Random(args.seed)
+            initial_count = len(del_variants)
+            del_variants = rng.sample(del_variants, args.max_variants)
+            logger.info(
+                f"Subsampled {args.max_variants} / {initial_count} deletion variants "
+                f"(seed={args.seed}) before boundary refinement."
+            )
+
         with BAMHandler(args.bam) as bam:
             # ... boundaries ...
             refined = []
@@ -279,7 +295,7 @@ def main():
 
         if args.balance:
             import random
-            random.seed(42)
+            random.seed(args.seed)
             if len(non_del_windows) > len(del_windows):
                 random.shuffle(non_del_windows)
                 non_del_windows = non_del_windows[:len(del_windows)]

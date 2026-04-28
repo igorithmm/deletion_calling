@@ -48,7 +48,8 @@ RUN_B_DIR="${WORK_DIR}/models/AB_${SAMPLE}/smoke/run_B_image_dnabert_11ch"
 COMPARE_DIR="${WORK_DIR}/reports/AB_${SAMPLE}/smoke"
 
 # Smoke-sized hyperparameters.
-LIMIT=200          # max windows per (deletion / non-deletion) class
+MAX_VARIANTS=50    # cap deletion variants BEFORE boundary refinement (slowest stage)
+LIMIT=200          # max windows per (deletion / non-deletion) class (post-refinement)
 EPOCHS=3
 BATCH_SIZE=16
 LR=3e-4
@@ -89,7 +90,8 @@ STAGE1_DONE_MARKER="${DATASET_DIR}/.stage1_done"
 if [ -f "$STAGE1_DONE_MARKER" ]; then
     echo "=== Stage 1 skipped (marker exists) ==="
 else
-    echo "=== Stage 1: generating image tensors + DNABERT-2 raw embeddings (limit=$LIMIT) ==="
+    echo "=== Stage 1: generating image tensors + DNABERT-2 raw embeddings ==="
+    echo "  max_variants=$MAX_VARIANTS (pre-refinement), limit=$LIMIT (post-refinement)"
     python3 scripts/generate_image_tensor_dataset.py generate \
         --bam "$BAM_PATH" \
         --vcf "$VCF" \
@@ -101,7 +103,9 @@ else
         --balance \
         --size all \
         --coloring-mode standard \
-        --limit "$LIMIT"
+        --max-variants "$MAX_VARIANTS" \
+        --limit "$LIMIT" \
+        --seed "$SEED"
     touch "$STAGE1_DONE_MARKER"
     echo "=== Stage 1 done ==="
 fi

@@ -99,7 +99,8 @@ else
         --exclude-sex \
         --balance \
         --size all \
-        --coloring-mode standard
+        --coloring-mode standard \
+        --seed "$SEED"
     touch "$STAGE1_DONE_MARKER"
     echo "=== Stage 1 done ==="
 fi
