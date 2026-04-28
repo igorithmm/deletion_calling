@@ -132,11 +132,32 @@ class DNABERT2Embedder:
         if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
             config.pad_token_id = self.tokenizer.pad_token_id
         
+        # low_cpu_mem_usage=False: avoid meta-tensor loading path. With newer
+        # transformers + accelerate, the default low_cpu_mem_usage=True can
+        # leave buffers on the 'meta' device for DNABERT-2's custom modeling
+        # code, then a subsequent .to(device) fails with
+        #   "Tensor on device meta is not on the expected device cpu!".
+        # Forcing materialisation on CPU first makes .to() reliable.
         self.model = AutoModel.from_pretrained(
-            resolved_path, config=config, trust_remote_code=True
+            resolved_path,
+            config=config,
+            trust_remote_code=True,
+            low_cpu_mem_usage=False,
         )
         self.model.eval()
         self.device = torch.device(device)
+
+        # Defensive guard: if any parameters/buffers are still on 'meta',
+        # the model would silently produce garbage outputs after .to().
+        meta_params = [n for n, p in self.model.named_parameters() if p.is_meta]
+        meta_buffers = [n for n, b in self.model.named_buffers() if b.is_meta]
+        if meta_params or meta_buffers:
+            raise RuntimeError(
+                f"DNABERT-2 still has meta tensors after low_cpu_mem_usage=False: "
+                f"params={meta_params[:3]}..., buffers={meta_buffers[:3]}... "
+                "Likely a transformers/accelerate version mismatch."
+            )
+
         self.model.to(self.device)
 
         # Freeze all parameters
@@ -220,6 +241,7 @@ class GenomicContextExtractor:
 
         self._ref: Optional[ReferenceGenome] = None
         self._embedder: Optional[DNABERT2Embedder] = None
+        self._embedder_init_failed: bool = False
         self._pca = None  # sklearn PCA, fitted later
         # z-score parameters fitted alongside PCA
         self._scaler_mean: Optional[np.ndarray] = None
@@ -235,10 +257,23 @@ class GenomicContextExtractor:
                 raise
 
     def _ensure_embedder(self):
-        if self._embedder is None:
+        if self._embedder is not None:
+            return
+        # Fail fast on a previous init failure: don't reload DNABERT-2 once
+        # per window (otherwise a config error spams the log with hundreds of
+        # "Loading DNABERT-2…" lines while every window silently fails).
+        if self._embedder_init_failed:
+            raise RuntimeError(
+                "DNABERT-2 embedder failed to initialise on a previous attempt; "
+                "fix the underlying error and restart."
+            )
+        try:
             self._embedder = DNABERT2Embedder(
                 model_id=self.model_id, device=self.device
             )
+        except Exception:
+            self._embedder_init_failed = True
+            raise
 
     def close(self):
         """Release resources."""
