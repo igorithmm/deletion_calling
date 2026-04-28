@@ -52,6 +52,18 @@ SEED=42
 N_PCA_COMPONENTS=8
 
 #=============================================
+# HuggingFace cache redirect
+# $HOME (/beegfs/...) is read-only on this cluster, but transformers with
+# trust_remote_code=True needs to write extracted .py modules somewhere.
+# Point all HF cache locations into the writable scratch tree.
+#=============================================
+export HF_HOME="${WORK_DIR}/.cache/huggingface"
+export TRANSFORMERS_CACHE="${HF_HOME}/hub"
+export HF_MODULES_CACHE="${HF_HOME}/modules"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_MODULES_CACHE" "$HF_DATASETS_CACHE"
+
+#=============================================
 # Conda
 #=============================================
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -100,7 +112,8 @@ else
         --balance \
         --size all \
         --coloring-mode standard \
-        --seed "$SEED"
+        --seed "$SEED" \
+        --dnabert-source hf
     touch "$STAGE1_DONE_MARKER"
     echo "=== Stage 1 done ==="
 fi

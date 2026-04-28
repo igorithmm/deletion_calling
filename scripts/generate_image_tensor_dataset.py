@@ -53,9 +53,12 @@ def _collect_windows(variants: List[Variant], region_size: int = 50) -> List[Tup
             pos += region_size
     return windows
 
-def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_name="sample", coloring_mode="standard", use_dnabert=True, dnabert_device="cpu", limit=None):
+def _generate_samples(bam_path, fasta_path, windows, label, output_dir, sample_name="sample", coloring_mode="standard", use_dnabert=True, dnabert_device="cpu", limit=None, dnabert_source="auto"):
     output_dir.mkdir(parents=True, exist_ok=True)
-    ctx_extractor = GenomicContextExtractor(fasta_path, device=dnabert_device) if use_dnabert else None
+    ctx_extractor = (
+        GenomicContextExtractor(fasta_path, device=dnabert_device, source=dnabert_source)
+        if use_dnabert else None
+    )
 
     # Eagerly initialise the embedder once: surfaces config errors (e.g. the
     # 'meta tensor' loading bug) before processing any window, instead of
@@ -228,6 +231,14 @@ def main():
     gen.add_argument("--coloring-mode", choices=["standard", "kmer"], default="standard")
     gen.add_argument("--no-dnabert", action="store_true")
     gen.add_argument("--device", default="cpu")
+    gen.add_argument(
+        "--dnabert-source",
+        choices=["auto", "hf", "local"],
+        default="auto",
+        help="Where to load DNABERT-2 from. 'hf' forces HuggingFace Hub "
+             "(useful when local copy ships with an outdated bert_layers.py). "
+             "'local' forces the local path. Default 'auto' tries local first.",
+    )
     gen.add_argument("--exclude-sex", action="store_true", help="Exclude chromosomes X and Y")
     gen.add_argument("--balance", action="store_true", help="Balance non-deletion windows to match deletion windows")
 
@@ -307,8 +318,12 @@ def main():
 
         out = Path(args.output)
         sample_name = args.sample if args.sample else "sample"
-        _generate_samples(args.bam, args.fasta, del_windows, 1, out / "deletion", sample_name, args.coloring_mode, not args.no_dnabert, args.device, args.limit)
-        _generate_samples(args.bam, args.fasta, non_del_windows, 0, out / "non_deletion", sample_name, args.coloring_mode, not args.no_dnabert, args.device, args.limit)
+        _generate_samples(args.bam, args.fasta, del_windows, 1, out / "deletion",
+                          sample_name, args.coloring_mode, not args.no_dnabert,
+                          args.device, args.limit, args.dnabert_source)
+        _generate_samples(args.bam, args.fasta, non_del_windows, 0, out / "non_deletion",
+                          sample_name, args.coloring_mode, not args.no_dnabert,
+                          args.device, args.limit, args.dnabert_source)
 
     elif args.command == "pca":
         fit_and_apply_pca(Path(args.dataset), args.n_components)
