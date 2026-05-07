@@ -111,7 +111,6 @@ else
         --exclude-sex \
         --balance \
         --size all \
-        --coloring-mode standard \
         --seed "$SEED" \
         --dnabert-source hf
     touch "$STAGE1_DONE_MARKER"

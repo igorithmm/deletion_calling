@@ -1,43 +1,37 @@
-"""Multichannel CNN for tensor-based SV detection (DeepSV3).
+"""Hybrid CNN for image + DNABERT-2 context (DeepSV 2.5).
 
 This module provides the BroadcastContextCNN architecture, which processes
 a (C, H, W) tensor where:
-  - C = 13 alignment channels + K genomic context channels
-  - H = max reads (padded)
-  - W = genomic window width (e.g. 50 bp)
+  - C = 3 RGB image channels + K genomic context channels
+  - H, W = image height / width (e.g. 256x256)
 
 The K context channels are constant along the H and W axes (broadcast from
-a K-dimensional DNABERT-2 embedding).
+a K-dimensional PCA-reduced DNABERT-2 embedding).
 """
 import torch
 import torch.nn as nn
 
-from deepsv.data.bam_handler import NUM_ALIGNMENT_CHANNELS
-
 
 class BroadcastContextCNN(nn.Module):
-    """2D CNN that processes alignment features + broadcast genomic context.
+    """2D CNN that processes image features + broadcast genomic context.
 
     Architecture:
         Conv2d blocks with BatchNorm + LeakyReLU, progressive channel
         scaling (32 → 64 → 128 → 256), adaptive average pooling,
         then a classifier head.
-
-    The model uses AdaptiveAvgPool2d so it can handle variable H (read
-    depth) without requiring a fixed spatial size.
     """
 
     def __init__(
         self,
         num_classes: int = 2,
         context_channels: int = 8,
-        alignment_channels: int = NUM_ALIGNMENT_CHANNELS,
+        alignment_channels: int = 3,
     ):
         """
         Args:
             num_classes: Output classes (default 2: deletion / non-deletion).
             context_channels: Number of PCA-reduced DNABERT-2 channels (K).
-            alignment_channels: Number of alignment feature channels (13).
+            alignment_channels: Number of image channels (3 for RGB).
         """
         super().__init__()
 

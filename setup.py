@@ -31,17 +31,17 @@ setup(
         "joblib>=1.3.0",
         "huggingface-hub>=0.16.0",
         "einops>=0.6.1",
+        "h5py>=3.9.0",
     ],
     entry_points={
         "console_scripts": [
-            "deepsv-generate-images=scripts.generate_training_images:main",
+            "deepsv-generate-dataset=scripts.generate_dataset:main",
             "deepsv-train=scripts.train_model:main",
             "deepsv-call=scripts.call_deletions:main",
             "deepsv-generate-image-tensor=scripts.generate_image_tensor_dataset:main",
             "deepsv-train-image-tensor=scripts.train_image_tensor_model:main",
-            "deepsv-generate-alignment-tensor=scripts.generate_tensor_dataset:main",
-            "deepsv-train-alignment-tensor=scripts.train_tensor_model:main",
             "deepsv-download-dnabert2=scripts.download_dnabert2:main",
+            "deepsv-precompute-embeddings=scripts.precompute_dnabert2_embeddings:main",
         ],
     },
     classifiers=[

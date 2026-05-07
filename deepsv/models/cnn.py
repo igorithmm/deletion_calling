@@ -56,41 +56,100 @@ class DeletionCNN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass
-        
-        Args:
-            x: Input tensor of shape (batch_size, channels, height, width)
-            
-        Returns:
-            Output logits
-        """
-        # Convolutional layers
+    # ------------------------------------------------------------------
+    # Named stages
+    #
+    # The forward pass is split into per-block helpers so that external
+    # wrappers (e.g. FusedDeepSV) can inject FiLM modulation between the
+    # named blocks without copying the architecture. The math executed by
+    # `forward(x)` is unchanged: it is `_forward_features_with_hooks(x)`
+    # with no hooks, which composes the helpers in the same order as the
+    # original monolithic implementation.
+    # ------------------------------------------------------------------
+
+    def _block1(self, x: torch.Tensor) -> torch.Tensor:
+        """Conv1 → ReLU → Pool1."""
         x = F.relu(self.conv1(x))
         x = self.pool1(x)
-        
+        return x
+
+    def _block2(self, x: torch.Tensor) -> torch.Tensor:
+        """Conv2 → ReLU → Pool2. Output channels: 256."""
         x = F.relu(self.conv2(x))
         x = self.pool2(x)
-        
+        return x
+
+    def _block3(self, x: torch.Tensor) -> torch.Tensor:
+        """Conv3 → ReLU. Output channels: 384."""
         x = F.relu(self.conv3(x))
-        
+        return x
+
+    def _block4(self, x: torch.Tensor) -> torch.Tensor:
+        """Conv4 → ReLU → Pool4."""
         x = F.relu(self.conv4(x))
         x = self.pool4(x)
-        
-        # Fully connected layers
+        return x
+
+    def _classify(self, x: torch.Tensor) -> torch.Tensor:
+        """Flatten → fc1 → ReLU → drop → fc2 → ReLU → drop → fc3."""
         x = self.flatten(x)
         x = self.fc1(x)
         x = F.relu(x)
         x = self.dropout1(x)
-        
+
         x = self.fc2(x)
         x = F.relu(x)
         x = self.dropout2(x)
-        
+
         x = self.fc3(x)
-        
         return x
+
+    def _forward_features_with_hooks(
+        self,
+        x: torch.Tensor,
+        hook2=None,
+        hook3=None,
+    ) -> torch.Tensor:
+        """Forward pass with optional callables applied to block-2 / block-3 outputs.
+
+        ``hook2`` (if provided) is called as ``hook2(feat) -> Tensor`` on the
+        output of :meth:`_block2`; similarly for ``hook3``. When both hooks
+        are ``None`` the math is byte-identical to the original
+        :meth:`forward` implementation.
+
+        Args:
+            x: Input tensor ``(B, C, H, W)``.
+            hook2: Optional callable applied after block 2.
+            hook3: Optional callable applied after block 3.
+
+        Returns:
+            Output logits.
+        """
+        x = self._block1(x)
+
+        x = self._block2(x)
+        if hook2 is not None:
+            x = hook2(x)
+
+        x = self._block3(x)
+        if hook3 is not None:
+            x = hook3(x)
+
+        x = self._block4(x)
+        x = self._classify(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+
+        Args:
+            x: Input tensor of shape (batch_size, channels, height, width)
+
+        Returns:
+            Output logits
+        """
+        return self._forward_features_with_hooks(x)
 
 
 class ModernDeletionCNN(nn.Module):

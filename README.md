@@ -5,15 +5,16 @@ DeepSV2 — это конвейер на базе глубокого обуче�
 ## Содержание
 
 1. [Обзор алгоритма](#обзор-алгоритма)
-2. [Структура проекта](#структура-проекта)
-3. [Установка](#установка)
-4. [Требования к данным](#требования-к-данным)
-5. [Этапы конвейера](#этапы-конвейера)
-   - [Этап 1: Генерация изображений](#этап-1-генерация-изображений)
-   - [Этап 2: Обучение модели](#этап-2-обучение-модели)
+2. [DeepSV 3.0 — FiLM + HyenaDNA](#deepsv-30--film--hyenadna)
+3. [Структура проекта](#структура-проекта)
+4. [Установка](#установка)
+5. [Требования к данным](#требования-к-данным)
+6. [Этапы конвейера](#этапы-конвейера)
+   - [Этап 1: Генерация изображений](#этап-1-генерация-гибридных-данных)
+   - [Этап 2: Обучение модели](#этап-2-обучение-гибридной-модели)
    - [Этап 3: Инференс (поиск делеций)](#этап-3-инференс-поиск-делеций)
-6. [Примеры использования](#примеры-использования)
-7. [Конфигурация](#конфигурация)
+7. [Примеры использования](#примеры-использования)
+8. [Конфигурация](#конфигурация)
 
 ---
 
@@ -36,6 +37,133 @@ BAM + VCF ──► Генерация изображений ──► Обуч
 
 ---
 
+## DeepSV 3.0 — FiLM + HyenaDNA
+
+DeepSV 3.0 добавляет **вторую модальность** — замороженные эмбеддинги последовательности от **HyenaDNA-small-32k**, которые сливаются с CNN-признаками через **FiLM-кондиционирование** (Feature-wise Linear Modulation, Perez et al., 2018).
+
+### Зачем это нужно
+
+Базовый CNN (M0) видит только пайлап (выравненные прочтения). Но та же геномная позиция несёт собственный «контекст последовательности» (мотивы, повторы, GC-состав), который частично объясняет, насколько *вероятно* появление сигнала делеции. HyenaDNA-эмбеддинг даёт сжатое (256-мерное) описание этого контекста, и FiLM позволяет ему **переключать** карты признаков CNN на лету, не нарушая исходную архитектуру.
+
+### Идея FiLM
+
+Для карты признаков `F` формы `(B, C, H, W)`:
+
+```
+γ, β = FiLMGenerator(embedding)        # каждое (B, C)
+F_out = F * (1 + γ.view(B, C, 1, 1)) + β.view(B, C, 1, 1)
+```
+
+Каждый `FiLMGenerator` — двухслойный MLP `Linear(256→128) → ReLU → Linear(128→2*C)`. **Финальный Linear инициализируется нулями** (и веса, и смещения), так что в момент `t=0` γ = β = 0 и FiLM **является точным тождеством**: `F_out = F`. Обучение начинается с поведения базового DeepSV и отклоняется от него только по мере того, как FiLM-головы что-то выучивают.
+
+### Куда внедряется FiLM
+
+| Точка | Размерность канала | Внедрение |
+|---|---|---|
+| После блока 1 (`pool1`) | 96 | ✗ слишком низкоуровневые признаки |
+| **После блока 2 (`pool2`)** | **256** | **✓ FiLM** |
+| **После блока 3 (`conv3`)** | **384** | **✓ FiLM** |
+| После блока 4 (`pool4`) | 256 | ✗ пространственная информация уже агрегирована |
+
+### Три модели
+
+| Имя | Архитектура | Вход | Назначение |
+|---|---|---|---|
+| **M0** | `DeletionCNN` | только изображение | Базовая модель DeepSV |
+| **M1** | `FusedDeepSV` | изображение + эмбеддинг | **Основной вклад** |
+| **M2** | `EmbeddingOnlyMLP` | только эмбеддинг | Sanity-check baseline |
+
+### Двухстадийное обучение
+
+Реализовано в `deepsv/training/film_trainer.py`:
+
+* **Стадия A** (по умолчанию 2 эпохи): backbone CNN заморожен, обучаются только FiLM-генераторы. Один param group, lr = **1e-3**.
+* **Стадия B** (оставшиеся эпохи): backbone разморожен, два param group: CNN @ **1e-4**, FiLM @ **1e-3**.
+
+Лучший чекпоинт выбирается по **валидационной F1** (положительный класс), а не по accuracy. Лосс — `nn.CrossEntropyLoss` поверх 2-классового softmax (математически эквивалент BCE для бинарной задачи на 2-логитной голове).
+
+### Прекомпьют эмбеддингов
+
+HyenaDNA **никогда не загружается во время обучения**. Один раз заранее запускается:
+
+```bash
+python scripts/precompute_hyenadna_embeddings.py \
+    --fasta raw/hs37d5.fa \
+    --output data/hyenadna_embeddings.h5 \
+    --device cuda \
+    --chrom 20 21 22 \
+    --genome-build hs37d5
+```
+
+Результат — HDF5-файл с layout:
+
+```
+/chr1   shape=(n_windows, 256)  dtype=float16   # n_windows = ceil(chrom_len / 50)
+/chr2   ...
+attrs:
+  window_bp    = 50
+  embed_dim    = 256
+  model_id     = LongSafari/hyenadna-small-32k-seqlen-hf
+  ...
+```
+
+Lookup: `emb = f["chr21"][position // 50]`. Файл открывается **read-only**, и для T4 GPU (16 GB VRAM) хромосомы 20–22 (~1.5 GB) **загружаются в RAM dict** при инициализации `FusedDataset`, чтобы избежать HDF5-чтений в каждом батче. Float16 → float32 cast делается перед входом в модель.
+
+### Стратифицированная оценка
+
+`FiLMTrainer.validate(...)` поддерживает per-bucket precision/recall/F1/mean-breakpoint-distance по:
+
+* **Длине делеции** (bp): `50–200`, `200–500`, `500–1k`, `1k–5k`, `5k–10k`.
+* **Классу повторов** через пересечение с RepeatMasker BED'ом (`pybedtools`): `unique` / `simple-repeat` / `segmental-dup`.
+
+Стратификация активируется, когда вызывающий код передаёт списки `sample_lengths`, `sample_repeat_classes`, `sample_breakpoint_distances` в `validate(...)`.
+
+### Использование из кода
+
+```python
+from deepsv.models import FusedDeepSV, EmbeddingOnlyMLP, DeletionCNN
+from deepsv.data import FusedDataset
+from deepsv.training import FiLMTrainer
+from deepsv.inference import FusedPredictor
+from torch.utils.data import DataLoader
+
+# Датасет: триплеты (image, embedding, label)
+train_ds = FusedDataset(
+    image_paths=train_images,
+    labels=train_labels,
+    chroms=train_chroms,                  # per-sample chromosome
+    positions=train_positions,            # per-sample window centre (bp)
+    embeddings_h5="data/hyenadna_embeddings.h5",
+    preload_chroms=["chr20", "chr21", "chr22"],
+    transform=image_transform,
+)
+train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4)
+
+# Модель + тренер
+model = FusedDeepSV(embed_dim=256, num_classes=2)
+trainer = FiLMTrainer(model)
+trainer.train(
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=10,
+    stage_a_epochs=2,
+    lr_cnn=1e-4,
+    lr_film=1e-3,
+    save_path="models/fused_deepsv_best.pth",
+)
+
+# Инференс
+predictor = FusedPredictor(
+    model=model,
+    embeddings_h5="data/hyenadna_embeddings.h5",
+    threshold=0.5,
+    preload_chroms=["chr20", "chr21", "chr22"],
+)
+prob, pred_class = predictor.predict("data/window.png", chrom="chr21", position=14400000)
+```
+
+---
+
 ## Структура проекта
 
 ```
@@ -43,15 +171,22 @@ deepsv2/
 ├── deepsv/                          # Основная библиотека
 │   ├── data/
 │   │   ├── bam_handler.py           # Работа с BAM: пайлап, покрытие, клиппирование
-│   │   └── vcf_handler.py           # Работа с VCF: загрузка вариантов, категории размеров
+│   │   ├── vcf_handler.py           # Работа с VCF: загрузка вариантов, категории размеров
+│   │   ├── genomic_context.py       # DNABERT-2 эмбеддер + PCA (DeepSV 2.5)
+│   │   └── fused_dataset.py         # (3.0) FusedDataset: (image, HyenaDNA emb, label)
 │   ├── visualization/
 │   │   └── image_generator.py       # Конвертация пайлапа в RGB-изображение 256×256
 │   ├── models/
-│   │   └── cnn.py                   # Архитектуры ModernDeletionCNN и DeletionCNN
+│   │   ├── cnn.py                   # DeletionCNN (M0, AlexNet-like) и ModernDeletionCNN
+│   │   ├── multichannel_cnn.py      # BroadcastContextCNN для 11-канального входа (2.5)
+│   │   ├── film.py                  # (3.0) FiLMGenerator + apply_film
+│   │   └── fused_cnn.py             # (3.0) FusedDeepSV (M1) + EmbeddingOnlyMLP (M2)
 │   ├── training/
-│   │   └── trainer.py               # Цикл обучения, валидация, чекпоинты
+│   │   ├── trainer.py               # Базовый ModelTrainer (M0, accuracy-based)
+│   │   └── film_trainer.py          # (3.0) FiLMTrainer: 2 стадии, F1-best, стратификация
 │   ├── inference/
-│   │   └── predictor.py             # Инференс модели на изображениях
+│   │   ├── predictor.py             # Базовый DeletionPredictor (M0)
+│   │   └── fused_predictor.py       # (3.0) FusedPredictor: image + embedding lookup
 │   ├── processing/
 │   │   ├── candidate_detector.py    # Поиск кандидатов (K-means на глубине и клиппировании)
 │   │   └── refinement.py            # Уточнение границ делеций через K-means
@@ -60,17 +195,18 @@ deepsv2/
 │       └── kmeans.py                # Реализация алгоритма K-means
 │
 ├── scripts/                         # Запускаемые скрипты
-│   ├── generate_image_tensor_dataset.py # Основной скрипт генерации гибридного датасета (RGB + контекст)
-│   ├── train_image_tensor_model.py  # Обучение гибридной модели с DNABERT-2 (DeepSV 2.5)
-│   ├── call_deletions.py            # Инференс: изображения → вызовы в VCF
-│   ├── check_bam_header.py          # Утилита для проверки заголовка BAM
-│   ├── train_sv2_5_balanced_no_sex.sh # Скрипт полного цикла обучения Hybrid-модели
-│   └── generate_training_images.py  # (Legacy) Генерация изображений
+│   ├── generate_image_tensor_dataset.py    # DeepSV 2.5: RGB + DNABERT-2 контекст
+│   ├── precompute_hyenadna_embeddings.py   # (3.0) Прекомпьют HyenaDNA → HDF5
+│   ├── precompute_dnabert2_embeddings.py   # Прекомпьют DNABERT-2 эмбеддингов
+│   ├── train_model.py                      # Цикл обучения
+│   ├── call_deletions.py                   # Инференс: изображения → вызовы в VCF
+│   ├── check_bam_header.py                 # Утилита для проверки заголовка BAM
+│   └── slurm/                              # SLURM-скрипты для кластерных запусков
 │
 ├── raw/                             # Исходные данные (BAM, VCF и индексы)
-├── data/                            # Сгенерированные изображения (выход)
+├── data/                            # Сгенерированные изображения + HDF5 с эмбеддингами
 ├── models/                          # Чекпоинты обученных моделей
-├── tests/                           # Юнит-тесты (например, тест уточнения границ)
+├── tests/                           # Юнит-тесты
 ├── requirements.txt
 └── setup.py
 ```
@@ -84,11 +220,14 @@ deepsv2/
 pip install -r requirements.txt
 
 # Необходимые пакеты:
-# - pysam          (чтение BAM/VCF)
-# - numpy, pandas  (обработка данных)
-# - Pillow         (создание изображений)
-# - torch, torchvision  (обучение и инференс CNN)
-# - scikit-learn, scipy  (анализ данных и K-means)
+# - pysam              (чтение BAM/VCF)
+# - numpy, pandas      (обработка данных)
+# - Pillow             (создание изображений)
+# - torch, torchvision (обучение и инференс CNN)
+# - scikit-learn, scipy (анализ данных и K-means)
+# - transformers       (DNABERT-2 / HyenaDNA загрузка)
+# - h5py, pyfaidx      (DeepSV 3.0: прекомпьют и хранение эмбеддингов)
+# - pybedtools         (DeepSV 3.0: стратификация по повторам — опционально)
 ```
 
 ---
@@ -198,6 +337,18 @@ chmod +x scripts/train_sv2_5_balanced_no_sex.sh
 | `--mode` | `hybrid` | Режим работы: `standard` или `hybrid` (устаревший `kmer` удален) |
 | `--del-count` | 2000 | Целевое количество изображений делеций на хромосому |
 | `--epochs` | 20 | Количество эпох обучения |
-| `--batch-size` | 32 | Размер батча |
+| `--batch-size` | 32 | Размер батча (для DeepSV 3.0 — 128 по спецификации) |
 | `--train-chroms` | 1-11 | Хромосомы для обучающей выборки |
 | `--val-chroms` | 12-22 | Хромосомы для валидационной выборки |
+
+### Параметры DeepSV 3.0 (FiLM)
+
+| Параметр (`FiLMTrainer.train`) | По умолчанию | Описание |
+|---|---|---|
+| `num_epochs` | 10 | Общее число эпох (Stage A + Stage B) |
+| `stage_a_epochs` | 2 | Сколько эпох обучать только FiLM (backbone заморожен) |
+| `lr_film` | 1e-3 | Learning rate для FiLM-генераторов в обеих стадиях |
+| `lr_cnn` | 1e-4 | Learning rate для backbone CNN (только Stage B) |
+| `weight_decay` | 1e-6 | L2-регуляризация |
+| `save_path` | — | Путь для лучшего чекпоинта (по валидационной F1) |
+| `validate_kwargs` | `{}` | Опциональные `sample_lengths` / `sample_repeat_classes` / `sample_breakpoint_distances` для стратификации |

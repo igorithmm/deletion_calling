@@ -114,7 +114,6 @@ else
         --exclude-sex \
         --balance \
         --size all \
-        --coloring-mode standard \
         --max-variants "$MAX_VARIANTS" \
         --limit "$LIMIT" \
         --seed "$SEED" \
