@@ -62,9 +62,9 @@ HYENADNA_MODEL_ID = "LongSafari/hyenadna-small-32k-seqlen-hf"
 HYENADNA_MODEL_REVISION = "main"  # PLACEHOLDER — override with --model-revision
 
 # ── Geometry (matches the algorithm in the module docstring) ─────────────────
-WINDOW_BP = 50          # output window: one embedding per 50 bp
-CORE_BP = 30_000        # non-overlapping core per forward pass
-FLANK_BP = 1_000        # flank context on each side
+WINDOW_BP = 50  # output window: one embedding per 50 bp
+CORE_BP = 30_000  # non-overlapping core per forward pass
+FLANK_BP = 1_000  # flank context on each side
 SEQ_BP = CORE_BP + 2 * FLANK_BP  # 32_000 — total input length
 WINDOWS_PER_CHUNK = CORE_BP // WINDOW_BP  # 600
 EMBED_DIM = 256
@@ -75,6 +75,7 @@ DEFAULT_CHROMS = [str(c) for c in range(1, 23)]
 # ═══════════════════════════════════════════════════════════════════════════
 # Model loading
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def load_model(
     model_id: str,
@@ -103,6 +104,7 @@ def load_model(
 # Sequence utilities
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def fetch_chunk_sequence(
     chrom_seq: pyfaidx.FastaRecord,
     chunk_idx: int,
@@ -124,8 +126,8 @@ def fetch_chunk_sequence(
 
     seq = str(chrom_seq[fetch_start:fetch_end]).upper()
 
-    left_pad = fetch_start - full_start   # > 0 if we clipped on the left
-    right_pad = full_end - fetch_end      # > 0 if we clipped on the right
+    left_pad = fetch_start - full_start  # > 0 if we clipped on the left
+    right_pad = full_end - fetch_end  # > 0 if we clipped on the right
     if left_pad or right_pad:
         seq = ("N" * left_pad) + seq + ("N" * right_pad)
 
@@ -145,6 +147,7 @@ def fasta_md5(fasta_path: str, block_size: int = 1 << 20) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # Per-chunk forward pass + pooling
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @torch.inference_mode()
 def embed_chunk(
@@ -190,6 +193,7 @@ def embed_chunk(
 # ═══════════════════════════════════════════════════════════════════════════
 # Main precompute loop
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def precompute(
     fasta_path: str,
@@ -300,6 +304,7 @@ def precompute(
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Precompute HyenaDNA embeddings for a reference genome.",
@@ -309,27 +314,33 @@ def main():
     parser.add_argument("--fasta", required=True, help="Path to reference FASTA")
     parser.add_argument("--output", required=True, help="Output HDF5 file path")
     parser.add_argument(
-        "--model-id", default=HYENADNA_MODEL_ID,
+        "--model-id",
+        default=HYENADNA_MODEL_ID,
         help="HuggingFace model ID",
     )
     parser.add_argument(
-        "--model-revision", default=HYENADNA_MODEL_REVISION,
+        "--model-revision",
+        default=HYENADNA_MODEL_REVISION,
         help="Pinned git revision (commit SHA). Avoid 'main' for reproducibility.",
     )
     parser.add_argument(
-        "--device", default="cuda",
+        "--device",
+        default="cuda",
         help="PyTorch device (cuda / cuda:0 / cpu)",
     )
     parser.add_argument(
-        "--chrom", nargs="*",
+        "--chrom",
+        nargs="*",
         help="Chromosome(s) to process. Default: autosomes 1-22",
     )
     parser.add_argument(
-        "--genome-build", default="",
+        "--genome-build",
+        default="",
         help="Human-readable genome build name (e.g. GRCh37, hs37d5)",
     )
     parser.add_argument(
-        "--resume", action="store_true",
+        "--resume",
+        action="store_true",
         help="Skip chromosomes already present in the output HDF5",
     )
 

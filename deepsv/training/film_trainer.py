@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sklearn.metrics import roc_auc_score
 import numpy as np
 import torch
 import torch.nn as nn
@@ -187,34 +188,51 @@ class FiLMTrainer:
         """One epoch of training over ``(image, embedding, label)`` triples."""
         self.model.train()
         running_loss = 0.0
-        correct = 0
-        total = 0
+        all_preds: List[int] = []
+        all_labels: List[int] = []
+        all_probs: List[float] = []
 
         pbar = tqdm(dataloader, desc="Training", leave=False)
         for images, embeddings, labels in pbar:
             images = images.to(self.device, non_blocking=True)
             embeddings = embeddings.to(self.device, non_blocking=True).float()
-            labels = labels.to(self.device, non_blocking=True)
+            labels_dev = labels.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad()
             outputs = self.model(images, embeddings)
-            loss = self.criterion(outputs, labels)
+            loss = self.criterion(outputs, labels_dev)
             loss.backward()
             self.optimizer.step()
 
             running_loss += loss.item()
+            probs = torch.softmax(outputs.data, dim=1)[:, 1]
             _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            
+            all_preds.extend(predicted.cpu().tolist())
+            all_labels.extend(labels.tolist())
+            all_probs.extend(probs.cpu().tolist())
 
             pbar.set_postfix({
-                "loss": running_loss / max(1, (total // labels.size(0))),
-                "acc": 100.0 * correct / max(1, total),
+                "loss": running_loss / max(1, len(all_labels) // labels.size(0)),
             })
+
+        y_true = np.array(all_labels)
+        y_pred = np.array(all_preds)
+        precision, recall, f1 = _binary_prf(y_true, y_pred)
+        acc = 100.0 * float((y_pred == y_true).mean()) if len(y_true) else 0.0
+        
+        try:
+            auc = roc_auc_score(y_true, all_probs)
+        except ValueError:
+            auc = 0.5
 
         return {
             "loss": running_loss / max(1, len(dataloader)),
-            "accuracy": 100.0 * correct / max(1, total),
+            "accuracy": acc,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "auc": auc,
         }
 
     @torch.no_grad()
@@ -263,6 +281,7 @@ class FiLMTrainer:
         running_loss = 0.0
         all_preds: List[int] = []
         all_labels: List[int] = []
+        all_probs: List[float] = []
 
         pbar = tqdm(dataloader, desc="Validating", leave=False)
         for images, embeddings, labels in pbar:
@@ -274,14 +293,21 @@ class FiLMTrainer:
             loss = self.criterion(outputs, labels_dev)
             running_loss += loss.item()
 
+            probs = torch.softmax(outputs.data, dim=1)[:, 1]
             _, predicted = torch.max(outputs.data, 1)
             all_preds.extend(predicted.cpu().tolist())
             all_labels.extend(labels.tolist())
+            all_probs.extend(probs.cpu().tolist())
 
         y_true = np.array(all_labels)
         y_pred = np.array(all_preds)
         precision, recall, f1 = _binary_prf(y_true, y_pred)
         acc = 100.0 * float((y_pred == y_true).mean()) if len(y_true) else 0.0
+        
+        try:
+            auc = roc_auc_score(y_true, all_probs)
+        except ValueError:
+            auc = 0.5
 
         metrics: Dict[str, float] = {
             "loss": running_loss / max(1, len(dataloader)),
@@ -289,6 +315,7 @@ class FiLMTrainer:
             "precision": precision,
             "recall": recall,
             "f1": f1,
+            "auc": auc,
         }
 
         if sample_breakpoint_distances is not None:
@@ -350,6 +377,17 @@ class FiLMTrainer:
 
         Returns the best-epoch validation metrics dict.
         """
+        # Compute class weights to handle imbalance
+        if hasattr(train_loader.dataset, 'labels'):
+            dataset_labels = np.array(train_loader.dataset.labels)
+            class_counts = np.bincount(dataset_labels)
+            if len(class_counts) == 2:
+                total = len(dataset_labels)
+                weights = total / (2.0 * class_counts)
+                class_weights = torch.FloatTensor(weights).to(self.device)
+                self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+                logger.info(f"Class imbalance handled. Counts: {class_counts}. Using weights: {weights}")
+
         validate_kwargs = validate_kwargs or {}
         best_f1 = -1.0
         best_metrics: Dict[str, float] = {}
@@ -419,13 +457,15 @@ class FiLMTrainer:
         dt = time.time() - t0
         msg = (
             f"[Stage {stage}] Epoch {epoch}/{total_epochs} | {dt:.1f}s | "
-            f"train loss {train_metrics['loss']:.4f} acc {train_metrics['accuracy']:.2f}%"
+            f"train loss {train_metrics['loss']:.4f} acc {train_metrics['accuracy']:.2f}% "
+            f"P {train_metrics['precision']:.3f} R {train_metrics['recall']:.3f} "
+            f"F1 {train_metrics['f1']:.3f} AUC {train_metrics['auc']:.3f}"
         )
         if val_metrics is not None:
             msg += (
                 f" | val loss {val_metrics['loss']:.4f} acc {val_metrics['accuracy']:.2f}% "
                 f"P {val_metrics['precision']:.3f} R {val_metrics['recall']:.3f} "
-                f"F1 {val_metrics['f1']:.3f}"
+                f"F1 {val_metrics['f1']:.3f} AUC {val_metrics['auc']:.3f}"
             )
         logger.info(msg)
 
