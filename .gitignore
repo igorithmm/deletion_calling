@@ -1,4 +1,5 @@
 /data/
+/scripts/slurm/
 raw/
 /models/
 old_deepsv/
