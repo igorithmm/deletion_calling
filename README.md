@@ -22,6 +22,7 @@ Two operating modes are supported:
 7. [CLI Reference](#cli-reference)
 8. [Python API](#python-api)
 9. [Configuration](#configuration)
+10. [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -441,3 +442,12 @@ with FusedPredictor(
         image_paths=paths, chroms=chroms, positions=positions
     )
 ```
+
+---
+
+## Acknowledgements
+
+CADC is a modernized and extended evolution of the original **DeepSV** project. We gratefully acknowledge the authors for the foundational ideas and code:
+
+*   **Repository**: [CSuperlei/DeepSV](https://github.com/CSuperlei/DeepSV)
+*   **Paper**: Cai, L., Wu, Y., & Gao, J. (2019). *DeepSV: accurate calling of genomic deletions from high-throughput sequencing data using deep convolutional neural network.* BMC Bioinformatics, 20, 665. [https://doi.org/10.1186/s12859-019-3299-y](https://doi.org/10.1186/s12859-019-3299-y)
