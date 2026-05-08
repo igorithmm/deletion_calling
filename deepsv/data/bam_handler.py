@@ -27,27 +27,6 @@ class BAMHandler:
         if self._bam_file:
             self._bam_file.close()
     
-    def get_reads(self, chrom: str, start: int, end: int) -> List[pysam.AlignedSegment]:
-        """
-        Extract reads from a genomic region
-        
-        Args:
-            chrom: Chromosome name
-            start: Start position
-            end: End position
-            
-        Returns:
-            List of aligned segments
-        """
-        if not self._bam_file:
-            raise RuntimeError("BAM file not opened. Use context manager.")
-        
-        reads = []
-        for read in self._bam_file.fetch(chrom, start, end):
-            if read.cigarstring is not None:
-                reads.append(read)
-        return reads
-    
     def get_coverage_depth(self, chrom: str, start: int, end: int) -> np.ndarray:
         """
         Calculate coverage depth for a region

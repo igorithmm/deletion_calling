@@ -1,10 +1,10 @@
 """FiLM-conditioned fusion of DeepSV image CNN with frozen sequence embeddings.
 
-:class:`FusedDeepSV` — the main contribution. Wraps the existing
-:class:`deepsv.models.cnn.DeletionCNN` and injects FiLM modulation
-(γ/β predicted from a 256-dim HyenaDNA embedding) after blocks 2 and 3
-of the CNN. The first block is too low-level and the fourth is too late
-(spatial info already aggregated), so they are not modulated.
+:class:`FusedDeepSV` — the main contribution. Wraps a
+:class:`~deepsv.models.cnn.ModernDeletionCNN` backbone and injects FiLM
+modulation (γ/β predicted from a HyenaDNA embedding) at two mid-level
+feature extraction points: after block 3 (128 ch) and block 4 (256 ch),
+using ``hook3``/``hook4`` kwargs.
 
 The fused model is initialised so that at step 0 it is a *bit-identical
 identity wrapper* around the underlying CNN: the FiLM generators are
@@ -19,23 +19,22 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .cnn import DeletionCNN
+from .cnn import ModernDeletionCNN
 from .film import FiLMGenerator, apply_film
 
 
-# Channel counts at the FiLM injection points in DeletionCNN. These match
-# the conv2 / conv3 output channel definitions in cnn.py and must be kept
-# in sync if the backbone is ever re-shaped.
-_BLOCK2_CHANNELS = 256
-_BLOCK3_CHANNELS = 384
+# Channel counts at the FiLM injection points.  These must match the
+# conv output channel definitions in cnn.py.
+_HOOK_A_CHANNELS = ModernDeletionCNN.BLOCK3_CHANNELS   # 128
+_HOOK_B_CHANNELS = ModernDeletionCNN.BLOCK4_CHANNELS   # 256
 
 
 class FusedDeepSV(nn.Module):
     """DeepSV CNN with FiLM modulation conditioned on a sequence embedding.
 
-    The wrapped backbone is :class:`DeletionCNN`. Two FiLM generators map a
-    256-dim embedding to ``(γ_2, β_2)`` for the block-2 feature map and
-    ``(γ_3, β_3)`` for the block-3 feature map.
+    Two FiLM generators map a conditioning embedding to ``(γ_a, β_a)`` and
+    ``(γ_b, β_b)`` which are injected after block 3 and block 4 of the
+    :class:`ModernDeletionCNN` backbone (``hook3`` / ``hook4``).
 
     Forward signature is ``(image, embedding) → logits``.
     """
@@ -46,7 +45,7 @@ class FusedDeepSV(nn.Module):
         num_classes: int = 2,
         input_channels: int = 3,
         film_hidden_dim: int = 128,
-        backbone: Optional[DeletionCNN] = None,
+        backbone: Optional[ModernDeletionCNN] = None,
     ) -> None:
         """Args:
             embed_dim: Sequence embedding dimensionality (default 256 for
@@ -54,25 +53,34 @@ class FusedDeepSV(nn.Module):
             num_classes: Number of classifier outputs.
             input_channels: Number of image channels (3 for RGB pileups).
             film_hidden_dim: Hidden width of each FiLM generator MLP.
-            backbone: Optionally inject a pre-existing :class:`DeletionCNN`
-                instance (e.g. for transfer-learning from a saved M0
-                checkpoint). If ``None``, a fresh CNN is constructed.
+            backbone: Optionally inject a pre-existing
+                :class:`ModernDeletionCNN` instance (e.g. for
+                transfer-learning from a saved M0 checkpoint).
+                If ``None``, a new :class:`ModernDeletionCNN` is constructed.
         """
         super().__init__()
 
         self.embed_dim = embed_dim
-        self.cnn = backbone if backbone is not None else DeletionCNN(
-            num_classes=num_classes, input_channels=input_channels
-        )
 
-        self.film2 = FiLMGenerator(
+        if backbone is not None:
+            self.cnn = backbone
+        else:
+            self.cnn = ModernDeletionCNN(
+                num_classes=num_classes, input_channels=input_channels,
+            )
+
+        # FiLM channel counts and hook kwarg names for ModernDeletionCNN.
+        self._hook_a_kwarg = "hook3"
+        self._hook_b_kwarg = "hook4"
+
+        self.film_a = FiLMGenerator(
             embed_dim=embed_dim,
-            num_channels=_BLOCK2_CHANNELS,
+            num_channels=_HOOK_A_CHANNELS,
             hidden_dim=film_hidden_dim,
         )
-        self.film3 = FiLMGenerator(
+        self.film_b = FiLMGenerator(
             embed_dim=embed_dim,
-            num_channels=_BLOCK3_CHANNELS,
+            num_channels=_HOOK_B_CHANNELS,
             hidden_dim=film_hidden_dim,
         )
 
@@ -86,9 +94,9 @@ class FusedDeepSV(nn.Module):
 
     def film_parameters(self):
         """Iterator over both FiLM generators' parameters."""
-        for p in self.film2.parameters():
+        for p in self.film_a.parameters():
             yield p
-        for p in self.film3.parameters():
+        for p in self.film_b.parameters():
             yield p
 
     def freeze_backbone(self) -> None:
@@ -106,7 +114,7 @@ class FusedDeepSV(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, image: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
-        """Forward pass with FiLM injection after blocks 2 and 3.
+        """Forward pass with FiLM injection at two mid-level backbone stages.
 
         Args:
             image: Tensor of shape ``(B, C, H, W)``.
@@ -116,14 +124,16 @@ class FusedDeepSV(nn.Module):
         Returns:
             Logits of shape ``(B, num_classes)``.
         """
-        gamma2, beta2 = self.film2(embedding)
-        gamma3, beta3 = self.film3(embedding)
+        gamma_a, beta_a = self.film_a(embedding)
+        gamma_b, beta_b = self.film_b(embedding)
 
-        def hook2(feat: torch.Tensor) -> torch.Tensor:
-            return apply_film(feat, gamma2, beta2)
+        def hook_a(feat: torch.Tensor) -> torch.Tensor:
+            return apply_film(feat, gamma_a, beta_a)
 
-        def hook3(feat: torch.Tensor) -> torch.Tensor:
-            return apply_film(feat, gamma3, beta3)
+        def hook_b(feat: torch.Tensor) -> torch.Tensor:
+            return apply_film(feat, gamma_b, beta_b)
 
-        return self.cnn._forward_features_with_hooks(image, hook2=hook2, hook3=hook3)
-
+        return self.cnn._forward_features_with_hooks(
+            image,
+            **{self._hook_a_kwarg: hook_a, self._hook_b_kwarg: hook_b},
+        )

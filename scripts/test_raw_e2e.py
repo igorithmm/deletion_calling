@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DeepSV2 Raw End-to-End Test (Multi-sample version).
+CADC Raw End-to-End Test (Multi-sample version).
 This script verifies the pipeline starting from RAW files for multiple regions:
 1. Extraction of read signals from BAM (BAMHandler).
 2. Generation of pileup images (ImageGenerator) and saving them.
@@ -31,7 +31,7 @@ from deepsv.visualization.image_generator import ImageGenerator
 
 def run_test():
     print("=" * 70)
-    print("DeepSV2: RAW End-to-End Pipeline Check (Multi-sample)")
+    print("CADC: RAW End-to-End Pipeline Check (Multi-sample)")
     print("=" * 70)
 
     # 1. Config

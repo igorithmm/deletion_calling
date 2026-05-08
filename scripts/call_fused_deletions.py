@@ -8,7 +8,7 @@ Reads:
 
 Writes a predictions CSV with one row per input window:
 
-    image_path, chrom, position, label, length, repeat_class,
+    image_path, chrom, position, label, length,
     prob_deletion, predicted_class
 
 Optionally, neighbouring positive windows are merged into deletion calls
@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deepsv.inference import FusedPredictor
 from deepsv.inference.predictor import DeletionPredictor
-from deepsv.models import DeletionCNN, FusedDeepSV
+from deepsv.models import ModernDeletionCNN, FusedDeepSV
 
 # Reuse the manifest loader from the training script.
 from train_fused_model import load_manifest  # type: ignore  # noqa: E402
@@ -71,7 +71,7 @@ def predict_m0(
     rows: List[dict], checkpoint: str, threshold: float, batch_size: int
 ) -> List[Tuple[float, int]]:
     """Image-only inference."""
-    model = DeletionCNN(num_classes=2)
+    model = ModernDeletionCNN(num_classes=2)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     predictor = DeletionPredictor(model=model, threshold=threshold)
@@ -229,13 +229,13 @@ def main() -> None:
     with open(args.predictions_out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "image_path", "chrom", "position", "label", "length", "repeat_class",
+            "image_path", "chrom", "position", "label", "length",
             "prob_deletion", "predicted_class",
         ])
         for r, (prob, cls) in zip(rows, preds):
             w.writerow([
                 r["image_path"], r["chrom"], r["position"], r["label"],
-                r["length"], r["repeat_class"], f"{prob:.6f}", cls,
+                r["length"], f"{prob:.6f}", cls,
             ])
     logger.info("Wrote per-window predictions to %s", args.predictions_out)
 

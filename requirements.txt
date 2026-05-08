@@ -1,19 +1,28 @@
+# Core ML framework
 torch>=2.0.0
 torchvision>=0.15.0
-pysam>=0.21.0
+
+# Genomics I/O
+pysam>=0.21.0          # BAM/VCF reading (pileup, clipping, genotype filtering)
+pyfaidx>=0.7.0         # FASTA chunking for HyenaDNA embedding precompute
+
+# Numerical computing
 numpy>=1.24.0
-pandas>=2.0.0
-Pillow>=10.0.0
-scikit-learn>=1.3.0
 scipy>=1.11.0
-matplotlib>=3.7.0
+
+# Dataset & metrics
+scikit-learn>=1.3.0    # precision_recall_fscore_support, roc_auc_score, bincount weights
+
+# Image processing
+Pillow>=10.0.0         # pileup PNG generation (ImageGenerator)
+
+# Progress & logging
 tqdm>=4.65.0
+
+# HuggingFace ecosystem (HyenaDNA loading)
 transformers>=4.30.0
-umap-learn>=0.5.3
-joblib>=1.3.0
 huggingface-hub>=0.16.0
-einops>=0.6.1
-# DeepSV 3.0 (FiLM + HyenaDNA)
-h5py>=3.9.0          # precomputed embedding store
-pyfaidx>=0.7.0       # FASTA chunking for HyenaDNA precompute
-pybedtools>=0.9.0    # optional: stratified-by-repeat eval
+einops>=0.6.1          # required by HyenaDNA attention layers
+
+# Embedding storage
+h5py>=3.9.0            # precomputed embedding store (FusedDataset, FusedPredictor)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Step 4 (training): train one of the two DeepSV 3.0 models.
+"""Step 4 (training): train one of the two CADC models.
 
 Models
 ──────
-* **M0** (``--model cnn``) — original :class:`DeletionCNN`, image only.
+* **M0** (``--model cnn``) — :class:`ModernDeletionCNN`, image only.
   Standard accuracy-best training via :class:`ModelTrainer`.
   Does NOT require HyenaDNA embeddings.
 * **M1** (``--model fused``) — :class:`FusedDeepSV` with FiLM modulation
@@ -13,7 +13,7 @@ Models
 Inputs
 ──────
 * ``--manifest`` — CSV produced by ``generate_fused_dataset.py`` with columns
-  ``image_path,chrom,position,label,length,repeat_class``.
+  ``image_path,chrom,position,label,length``.
 * ``--embeddings`` — HDF5 file produced by ``precompute_hyenadna_embeddings.py``.
   Required only for ``--model fused``.
 * ``--train-chroms`` / ``--val-chroms`` — chromosome split for train/val.
@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deepsv.data import FusedDataset
-from deepsv.models import DeletionCNN, FusedDeepSV
+from deepsv.models import ModernDeletionCNN, FusedDeepSV
 from deepsv.training import FiLMTrainer
 from deepsv.training.trainer import ImageDataset, ModelTrainer
 
@@ -90,7 +90,6 @@ def manifest_to_lists(rows: List[dict]) -> Dict[str, list]:
         "chroms": [r["chrom"] for r in rows],
         "positions": [r["position"] for r in rows],
         "lengths": [r["length"] for r in rows],
-        "repeat_classes": [r["repeat_class"] for r in rows],
     }
 
 
@@ -181,7 +180,7 @@ def train_m0(
         num_workers=args.num_workers, pin_memory=True,
     )
 
-    model = DeletionCNN(num_classes=2)
+    model = ModernDeletionCNN(num_classes=2)
     trainer = ModelTrainer(model)
     trainer.setup_optimizer(learning_rate=args.lr_cnn, weight_decay=args.weight_decay)
     trainer.train(
@@ -201,7 +200,6 @@ def train_m1(train_rows, val_rows, args) -> None:
     val_va = manifest_to_lists(val_rows)
     validate_kwargs = {
         "sample_lengths": val_va["lengths"],
-        "sample_repeat_classes": val_va["repeat_classes"],
     }
 
     model = FusedDeepSV(embed_dim=args.embed_dim, num_classes=2)

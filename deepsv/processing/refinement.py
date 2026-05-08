@@ -3,7 +3,7 @@ import pandas as pd
 import logging
 from typing import List, Tuple, Dict
 from deepsv.data.bam_handler import BAMHandler
-from deepsv.data.vcf_handler import Variant, DeletionSize
+from deepsv.data.vcf_handler import Variant
 from deepsv.utils.kmeans import kmeans
 
 logger = logging.getLogger(__name__)
@@ -157,10 +157,11 @@ class BoundaryRefiner:
             deletion_cluster = clusters[min_idx]
             
             # "class_one_3D = class_one_3D[np.lexsort(class_one_3D[:,::-1].T)]" -> Sort by position
-            # Our data is already sorted by position from construction
+            # K-means does NOT guarantee sorted output — use min/max instead
+            # of assuming first/last rows correspond to boundary positions.
             
-            del_cluster_start_pos = int(deletion_cluster[0, 0])
-            del_cluster_end_pos = int(deletion_cluster[-1, 0])
+            del_cluster_start_pos = int(deletion_cluster[:, 0].min())
+            del_cluster_end_pos = int(deletion_cluster[:, 0].max())
              
             # "int(class_one_3D[0,0]) != smooth_kmeans[0,0]"
             # Logic: verify the deletion cluster doesn't start at the very beginning of the analyzed window

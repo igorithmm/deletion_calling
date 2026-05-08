@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a fused-pipeline dataset: pileup images + per-sample metadata.
 
-This script implements **Steps 1–3** of the DeepSV 3.0 algorithm:
+This script implements **Steps 1–3** of the CADC pipeline:
 
     Step 1  Feature extraction & noise filtering
             (read depth + clipping signals, 61-bp median filter)
@@ -13,7 +13,7 @@ This script implements **Steps 1–3** of the DeepSV 3.0 algorithm:
 For every 50-bp window it writes:
   * a PNG image to ``<out_dir>/<sample>/<deletion|non_deletion>/<filename>.png``
   * a row to ``<out_dir>/<sample>/manifest.csv`` with columns:
-      image_path, chrom, position, label, length, repeat_class
+      image_path, chrom, position, label, length
 
 The manifest is the **source of truth** consumed by:
   * ``train_fused_model.py``  — builds ``FusedDataset`` from these rows
@@ -49,7 +49,7 @@ from typing import List, Optional, Sequence, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deepsv.data.bam_handler import BAMHandler
-from deepsv.data.vcf_handler import DeletionSize, Variant, VCFHandler
+from deepsv.data.vcf_handler import Variant, VCFHandler
 from deepsv.processing.refinement import BoundaryRefiner
 from deepsv.visualization.image_generator import ImageGenerator
 
@@ -63,43 +63,6 @@ logger = logging.getLogger(__name__)
 WINDOW_BP = 50  # window size — must match the embeddings precompute
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Repeat-class lookup (optional, opt-in via --repeat-bed)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def classify_repeat(
-    chrom: str,
-    start: int,
-    end: int,
-    repeat_bed: Optional[str],
-    simple_repeat_bed: Optional[str],
-    segdup_bed: Optional[str],
-) -> str:
-    """Return one of ``"unique"`` / ``"simple-repeat"`` / ``"segmental-dup"``.
-
-    If ``pybedtools`` is unavailable or no BED files are supplied, returns
-    ``"unique"`` for every sample (the safe default — equivalent to "no
-    information").
-    """
-    if not (repeat_bed or simple_repeat_bed or segdup_bed):
-        return "unique"
-    try:
-        import pybedtools  # local import — heavy, optional
-    except ImportError:
-        return "unique"
-
-    interval = pybedtools.BedTool(f"{chrom}\t{start}\t{end}\n", from_string=True)
-    if segdup_bed and Path(segdup_bed).exists():
-        if interval.intersect(pybedtools.BedTool(segdup_bed), u=True).count() > 0:
-            return "segmental-dup"
-    if simple_repeat_bed and Path(simple_repeat_bed).exists():
-        if interval.intersect(pybedtools.BedTool(simple_repeat_bed), u=True).count() > 0:
-            return "simple-repeat"
-    if repeat_bed and Path(repeat_bed).exists():
-        if interval.intersect(pybedtools.BedTool(repeat_bed), u=True).count() > 0:
-            return "simple-repeat"
-    return "unique"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +78,6 @@ class WindowRecord:
     position: int       # 0-based start of the 50-bp window
     label: int          # 1 = deletion, 0 = non-deletion
     length: int         # parent variant length (bp)
-    repeat_class: str   # unique / simple-repeat / segmental-dup
 
 
 def windows_for_variant(
@@ -124,7 +86,6 @@ def windows_for_variant(
     image_gen: ImageGenerator,
     out_dir: Path,
     label: int,
-    repeat_class: str,
 ) -> List[WindowRecord]:
     """Render a 50-bp sliding window across [variant.start, variant.end).
 
@@ -164,7 +125,6 @@ def windows_for_variant(
                 position=start,
                 label=label,
                 length=variant.length,
-                repeat_class=repeat_class,
             )
         )
     return records
@@ -185,9 +145,6 @@ def generate(
     min_length: int = 50,
     del_count_per_chrom: Optional[int] = None,
     refine_boundaries: bool = True,
-    repeat_bed: Optional[str] = None,
-    simple_repeat_bed: Optional[str] = None,
-    segdup_bed: Optional[str] = None,
     seed: int = 42,
 ) -> Path:
     """Run Steps 1–3 end-to-end and write a manifest CSV.
@@ -248,16 +205,12 @@ def generate(
                 except Exception as e:
                     logger.debug("refinement failed for %s: %s", variant, e)
 
-            repeat_cls = classify_repeat(
-                variant.chrom, variant.start, variant.end,
-                repeat_bed, simple_repeat_bed, segdup_bed,
-            )
 
             # Positive-class images.
             rows.extend(
                 windows_for_variant(
                     variant, bam, image_gen, del_dir,
-                    label=1, repeat_class=repeat_cls,
+                    label=1,
                 )
             )
 
@@ -266,12 +219,10 @@ def generate(
             anchors = vcf.get_non_deletion_regions([variant], anchor_type="up")
             anchors += vcf.get_non_deletion_regions([variant], anchor_type="down")
             for a in anchors:
-                # The anchor inherits the parent's repeat_class — it's used
-                # only for stratified eval grouping.
                 rows.extend(
                     windows_for_variant(
                         a, bam, image_gen, nondel_dir,
-                        label=0, repeat_class=repeat_cls,
+                        label=0,
                     )
                 )
 
@@ -285,9 +236,9 @@ def generate(
     manifest_path = out_root / "manifest.csv"
     with manifest_path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["image_path", "chrom", "position", "label", "length", "repeat_class"])
+        w.writerow(["image_path", "chrom", "position", "label", "length"])
         for r in rows:
-            w.writerow([r.image_path, r.chrom, r.position, r.label, r.length, r.repeat_class])
+            w.writerow([r.image_path, r.chrom, r.position, r.label, r.length])
 
     n_pos = sum(1 for r in rows if r.label == 1)
     n_neg = len(rows) - n_pos
@@ -329,9 +280,6 @@ def parse_args() -> argparse.Namespace:
         "--no-refine", action="store_true",
         help="Skip K-means breakpoint refinement (Step 2)",
     )
-    p.add_argument("--repeat-bed", default=None, help="RepeatMasker BED for stratification")
-    p.add_argument("--simple-repeat-bed", default=None)
-    p.add_argument("--segdup-bed", default=None)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -351,9 +299,6 @@ def main() -> None:
         min_length=args.min_length,
         del_count_per_chrom=args.del_count,
         refine_boundaries=not args.no_refine,
-        repeat_bed=args.repeat_bed,
-        simple_repeat_bed=args.simple_repeat_bed,
-        segdup_bed=args.segdup_bed,
         seed=args.seed,
     )
 

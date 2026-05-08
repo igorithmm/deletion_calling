@@ -11,21 +11,18 @@ Stages
 Best checkpoint is selected by **validation F1** (positive class), not
 accuracy. Loss is binary cross-entropy on the 2-class softmax head
 (equivalent to ``nn.CrossEntropyLoss`` on logits, which is what the
-underlying ``DeletionCNN`` exposes).
+underlying CNN exposes).
 
 Stratified evaluation
 ─────────────────────
-When a per-sample length and/or repeat-class is supplied to :meth:`validate`
-(via the dataset, see :func:`stratify_by_length` and
-:func:`stratify_by_repeat`), per-bucket precision / recall / F1 / mean
-breakpoint distance are also reported.
+reported.
 """
 from __future__ import annotations
 
 import logging
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from sklearn.metrics import roc_auc_score
 import numpy as np
@@ -53,56 +50,8 @@ LENGTH_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
     ("5k-10k", 5_000, 10_000),
 )
 
-# Repeat-class labels.
-REPEAT_CLASSES: Tuple[str, ...] = ("unique", "simple-repeat", "segmental-dup")
 
 
-def stratify_by_length(length_bp: int) -> Optional[str]:
-    """Return the bucket name for a deletion length, or ``None`` if it falls
-    outside all configured ranges (half-open ``[lo, hi)``)."""
-    for name, lo, hi in LENGTH_BUCKETS:
-        if lo <= length_bp < hi:
-            return name
-    return None
-
-
-def stratify_by_repeat(
-    chrom: str,
-    start: int,
-    end: int,
-    repeat_bed: str,
-    simple_repeat_bed: Optional[str] = None,
-    segmental_dup_bed: Optional[str] = None,
-) -> str:
-    """Classify a deletion as unique / simple-repeat / segmental-dup.
-
-    Uses ``pybedtools`` to intersect the deletion interval with the supplied
-    annotation BEDs. Priority (when overlapping multiple): segmental-dup >
-    simple-repeat > unique.
-
-    Args:
-        chrom: Chromosome name.
-        start: Deletion start (0-based).
-        end: Deletion end (exclusive).
-        repeat_bed: General RepeatMasker BED used as fallback when the
-            split BEDs aren't provided.
-        simple_repeat_bed: Optional simple-repeat-only BED.
-        segmental_dup_bed: Optional segmental-dup-only BED.
-    """
-    import pybedtools  # local import — heavy, optional dep
-
-    interval = pybedtools.BedTool(f"{chrom}\t{start}\t{end}\n", from_string=True)
-
-    if segmental_dup_bed and Path(segmental_dup_bed).exists():
-        if interval.intersect(pybedtools.BedTool(segmental_dup_bed), u=True).count() > 0:
-            return "segmental-dup"
-    if simple_repeat_bed and Path(simple_repeat_bed).exists():
-        if interval.intersect(pybedtools.BedTool(simple_repeat_bed), u=True).count() > 0:
-            return "simple-repeat"
-    if repeat_bed and Path(repeat_bed).exists():
-        if interval.intersect(pybedtools.BedTool(repeat_bed), u=True).count() > 0:
-            return "simple-repeat"
-    return "unique"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -240,15 +189,14 @@ class FiLMTrainer:
         self,
         dataloader: DataLoader,
         sample_lengths: Optional[Sequence[int]] = None,
-        sample_repeat_classes: Optional[Sequence[str]] = None,
         sample_breakpoint_distances: Optional[Sequence[float]] = None,
     ) -> Dict[str, float]:
         """Validate, optionally with stratified metrics.
 
         .. important::
             Stratified metrics assume the iteration order of ``dataloader``
-            matches the order of ``sample_lengths`` / ``sample_repeat_classes``
-            / ``sample_breakpoint_distances``. The loader **must** therefore
+            matches the order of ``sample_lengths`` /
+            ``sample_breakpoint_distances``. The loader **must** therefore
             be constructed with ``shuffle=False`` (no ``RandomSampler``).
             This is checked and a warning is logged on mismatch.
 
@@ -257,17 +205,11 @@ class FiLMTrainer:
                 stratified arg is supplied).
             sample_lengths: List aligned with the dataset; deletion length
                 in bp per sample.
-            sample_repeat_classes: List aligned with the dataset; one of
-                ``"unique"`` / ``"simple-repeat"`` / ``"segmental-dup"``.
             sample_breakpoint_distances: List aligned with the dataset;
                 external breakpoint-distance estimate per sample.
         """
         # Guard against silent misalignment when callers shuffle by accident.
-        any_stratified = any(
-            v is not None for v in (
-                sample_lengths, sample_repeat_classes, sample_breakpoint_distances
-            )
-        )
+        any_stratified = any(v is not None for v in (sample_lengths, sample_breakpoint_distances))
         if any_stratified:
             from torch.utils.data import RandomSampler  # local import
             sampler = getattr(dataloader, "sampler", None)
@@ -340,20 +282,6 @@ class FiLMTrainer:
                         np.asarray(sample_breakpoint_distances)[mask].mean()
                     )
 
-        if sample_repeat_classes is not None and len(sample_repeat_classes) == n:
-            classes = np.asarray(sample_repeat_classes)
-            for cls in REPEAT_CLASSES:
-                mask = classes == cls
-                if mask.sum() == 0:
-                    continue
-                p, r, f = _binary_prf(y_true[mask], y_pred[mask])
-                metrics[f"f1_repeat_{cls}"] = f
-                metrics[f"precision_repeat_{cls}"] = p
-                metrics[f"recall_repeat_{cls}"] = r
-                if sample_breakpoint_distances is not None:
-                    metrics[f"mean_bp_dist_repeat_{cls}"] = float(
-                        np.asarray(sample_breakpoint_distances)[mask].mean()
-                    )
 
         return metrics
 
@@ -473,14 +401,3 @@ class FiLMTrainer:
         torch.save(self.model.state_dict(), path)
         logger.info("New best F1 — checkpoint saved to %s", path)
 
-    def save_model(self, path: Path) -> None:
-        """Save the full model state dict."""
-        torch.save(self.model.state_dict(), path)
-        logger.info("Model saved to %s", path)
-
-    def load_model(self, path: Path) -> None:
-        """Load a model state dict from disk."""
-        self.model.load_state_dict(
-            torch.load(path, map_location=self.device, weights_only=True)
-        )
-        logger.info("Model loaded from %s", path)

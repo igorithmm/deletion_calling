@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end DeepSV 3.0 pipeline driver.
+# End-to-end CADC pipeline driver.
 #
 # Stages
 # ──────
@@ -23,7 +23,7 @@
 #       --out-root runs/exp1
 #
 # Arguments map 1:1 onto the underlying scripts; everything else uses sane
-# defaults. Set DEEPSV_PYTHON to override the python interpreter.
+# defaults. Set CADC_PYTHON to override the python interpreter.
 
 set -euo pipefail
 
@@ -44,7 +44,7 @@ BATCH_SIZE=128
 LR_CNN=1e-4
 LR_FILM=1e-3
 THRESHOLD=0.5
-OUT_ROOT="runs/deepsv3"
+OUT_ROOT="runs/cadc"
 DEVICE="cuda"
 EMBEDDINGS_H5=""                   # if empty, will be set under OUT_ROOT
 SKIP_PRECOMPUTE=0
@@ -52,7 +52,7 @@ SKIP_GENERATE=0
 SKIP_TRAIN=0
 SKIP_INFER=0
 
-PY="${DEEPSV_PYTHON:-python3}"
+PY="${CADC_PYTHON:-python3}"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -112,7 +112,7 @@ VCF_OUT="$PRED_DIR/${SAMPLE}_${MODEL}.vcf"
 MANIFEST="$DATA_DIR/$SAMPLE/manifest.csv"
 
 echo "════════════════════════════════════════════════════════════════════"
-echo " DeepSV 3.0 pipeline"
+echo " CADC pipeline"
 echo "   sample      : $SAMPLE"
 echo "   model       : $MODEL"
 echo "   bam         : $BAM"

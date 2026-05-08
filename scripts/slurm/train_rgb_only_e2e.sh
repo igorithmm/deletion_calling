@@ -6,7 +6,7 @@
 #=============================================
 # SLURM parameters
 #=============================================
-#SBATCH --job-name=deepsv_rgb_e2e
+#SBATCH --job-name=cadc_rgb_e2e
 #SBATCH --partition=gpu_T4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -35,10 +35,21 @@ TRAIN_CHROMS="1,2,3,4,5,6,7,8,9,10,11"
 VAL_CHROMS="12,13,14,15,16,17,18,19,20,21,22"
 ALL_CHROMS="${TRAIN_CHROMS},${VAL_CHROMS}"
 
-COMBINED_MANIFEST="${WORK_DIR}/data/combined_manifest_rgb.csv"
-OUTPUT_MODEL="${WORK_DIR}/models/rgb_only_best.pth"
-LOG_FILE="${WORK_DIR}/logs/training_rgb_only.log"
-DASHBOARD="${WORK_DIR}/logs/rgb_training_dashboard.png"
+OUTPUT_DIR="${WORK_DIR}/data/fused_${SLURM_JOB_ID}"
+COMBINED_MANIFEST="${WORK_DIR}/data/manifest_${SLURM_JOB_ID}.csv"
+OUTPUT_MODEL="${WORK_DIR}/models/model_${SLURM_JOB_ID}.pth"
+LOG_FILE="${WORK_DIR}/logs/train_${SLURM_JOB_ID}.log"
+DASHBOARD="${WORK_DIR}/logs/dashboard_${SLURM_JOB_ID}.png"
+
+#=============================================
+# Cache Setup
+#=============================================
+export HF_HOME="${WORK_DIR}/.cache/huggingface"
+export TRANSFORMERS_CACHE="${HF_HOME}/hub"
+export HF_MODULES_CACHE="${HF_HOME}/modules"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export MPLCONFIGDIR="${WORK_DIR}/.cache/matplotlib"
+mkdir -p "$HF_HOME" "$HF_MODULES_CACHE" "$HF_DATASETS_CACHE" "$MPLCONFIGDIR"
 
 #=============================================
 # Conda Setup
@@ -46,7 +57,7 @@ DASHBOARD="${WORK_DIR}/logs/rgb_training_dashboard.png"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate deepsv2_new
 
-mkdir -p "${WORK_DIR}/data/fused" "${WORK_DIR}/models" "${WORK_DIR}/logs"
+mkdir -p "$OUTPUT_DIR" "${WORK_DIR}/models" "${WORK_DIR}/logs"
 cd "$REPO_DIR"
 
 echo "=== Starting RGB-only End-to-End Pipeline ==="
@@ -67,19 +78,22 @@ rm -f "$COMBINED_MANIFEST"
 for BAM in "${BAM_DIR}"/*.bam; do
     # Extract sample name (e.g. NA12878 from NA12878.mapped.ILLUMINA.bwa.CEU.high_coverage_pcr_free.20130906.bam)
     SAMPLE=$(basename "$BAM" | cut -d'.' -f1)
+    MANIFEST="${OUTPUT_DIR}/${SAMPLE}/manifest.csv"
     
-    echo "  -> Processing sample: $SAMPLE"
-    python3 scripts/generate_fused_dataset.py \
-        --sample "$SAMPLE" \
-        --bam "$BAM" \
-        --vcf "$VCF" \
-        --chroms "$ALL_CHROMS" \
-        --output-dir "${WORK_DIR}/data/fused" \
-        --max-length 10000 \
-        --min-length 50 \
-        --del-count 1500
-        
-    MANIFEST="${WORK_DIR}/data/fused/${SAMPLE}/manifest.csv"
+    if [ -f "$MANIFEST" ]; then
+        echo "  -> Manifest for $SAMPLE already exists. Skipping data generation."
+    else
+        echo "  -> Processing sample: $SAMPLE"
+        python3 scripts/generate_fused_dataset.py \
+            --sample "$SAMPLE" \
+            --bam "$BAM" \
+            --vcf "$VCF" \
+            --chroms "$ALL_CHROMS" \
+            --output-dir "${OUTPUT_DIR}" \
+            --max-length 10000 \
+            --min-length 50 \
+            --del-count 1500
+    fi
     
     # Merge into the combined manifest
     if [ ! -f "$COMBINED_MANIFEST" ]; then
@@ -119,6 +133,8 @@ echo "=== Step 3: Generating Metrics Dashboard ==="
 
 python3 - <<EOF
 import re
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 log_file = "${LOG_FILE}"

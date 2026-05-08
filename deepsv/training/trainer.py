@@ -102,6 +102,7 @@ class ModelTrainer:
         """
         self.model.train()
         running_loss = 0.0
+        num_batches = 0
         
         all_labels = []
         all_preds = []
@@ -123,6 +124,7 @@ class ModelTrainer:
             
             # Statistics
             running_loss += loss.item()
+            num_batches += 1
             probs = torch.softmax(outputs.data, dim=1)[:, 1]
             _, predicted = torch.max(outputs.data, 1)
             
@@ -132,7 +134,7 @@ class ModelTrainer:
             
             # Update progress bar
             pbar.set_postfix({
-                'loss': running_loss / (len(all_labels) / labels.size(0))
+                'loss': running_loss / num_batches
             })
         
         epoch_loss = running_loss / len(dataloader)
@@ -161,6 +163,7 @@ class ModelTrainer:
         """
         self.model.eval()
         running_loss = 0.0
+        num_batches = 0
         
         all_labels = []
         all_preds = []
@@ -176,6 +179,7 @@ class ModelTrainer:
                 loss = self.criterion(outputs, labels)
                 
                 running_loss += loss.item()
+                num_batches += 1
                 probs = torch.softmax(outputs.data, dim=1)[:, 1]
                 _, predicted = torch.max(outputs.data, 1)
                 
@@ -185,7 +189,7 @@ class ModelTrainer:
                 
                 # Update progress bar
                 pbar.set_postfix({
-                    'loss': running_loss / (len(all_labels) / labels.size(0))
+                    'loss': running_loss / num_batches
                 })
         
         val_loss = running_loss / len(dataloader)
@@ -267,6 +271,10 @@ class ModelTrainer:
                 logger.info(f"Train Loss: {train_metrics['loss']:.4f}, Train Acc: {train_metrics['accuracy']:.2f}%, "
                             f"P: {train_metrics['precision']:.3f}, R: {train_metrics['recall']:.3f}, "
                             f"F1: {train_metrics['f1']:.3f}, AUC: {train_metrics['auc']:.3f}")
+                # Save model at end of each epoch when no val_loader is available
+                if save_path:
+                    torch.save(self.model.state_dict(), save_path)
+                    logger.info(f"Model saved to {save_path} (no validation set)")
             
             # Update learning rate
             if self.scheduler:
@@ -278,14 +286,3 @@ class ModelTrainer:
         
         total_duration = time.time() - start_time
         logger.info(f"Training completed in {total_duration/60:.2f} minutes.")
-    
-    def save_model(self, path: Path):
-        """Save model state"""
-        torch.save(self.model.state_dict(), path)
-        logger.info(f"Model saved to {path}")
-    
-    def load_model(self, path: Path):
-        """Load model state"""
-        self.model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
-        logger.info(f"Model loaded from {path}")
-

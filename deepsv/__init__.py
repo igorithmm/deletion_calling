@@ -1,4 +1,4 @@
-"""DeepSV: Deep Learning-based Structural Variant Calling for Long Deletions"""
+"""CADC — Context-Aware Deletion Caller"""
 
-__version__ = "2.5.0"
+__version__ = "1.0.0"
 

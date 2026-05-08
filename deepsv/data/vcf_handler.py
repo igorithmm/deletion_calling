@@ -1,15 +1,6 @@
 """VCF file handling and variant processing"""
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from dataclasses import dataclass
-from enum import Enum
-
-
-class DeletionSize(Enum):
-    """Deletion size categories"""
-    SMALL = (50, 200)      # 50-200 bp
-    MEDIUM = (200, 700)    # 200-700 bp
-    LARGE = (700, 1000)    # 700-1000 bp
-    VERY_LARGE = (1000, None)  # >1000 bp
 
 
 @dataclass
@@ -24,26 +15,10 @@ class Variant:
     def length(self) -> int:
         """Calculate variant length"""
         return abs(self.end - self.start)
-    
-    @property
-    def size_category(self) -> DeletionSize:
-        """Get size category for this variant"""
-        length = self.length
-        if 50 <= length < 200:
-            return DeletionSize.SMALL
-        elif 200 <= length < 700:
-            return DeletionSize.MEDIUM
-        elif 700 <= length < 1000:
-            return DeletionSize.LARGE
-        elif length >= 1000:
-            return DeletionSize.VERY_LARGE
-        else:
-            # Sub-50bp variants are not structural variants; classify as SMALL
-            return DeletionSize.SMALL
 
 
 class VCFHandler:
-    """Handles VCF file parsing and variant categorization using pysam"""
+    """Handles VCF file parsing using pysam"""
     
     def __init__(self, vcf_path: str):
         """
@@ -53,9 +28,6 @@ class VCFHandler:
             vcf_path: Path to VCF file (gzip compressed and indexed)
         """
         self.vcf_path = vcf_path
-        self.variants: Dict[DeletionSize, List[Variant]] = {
-            size: [] for size in DeletionSize
-        }
     
     def load_variants(self, variant_type: str = "deletion", sample_id: str = None) -> List[Variant]:
         """
@@ -136,20 +108,7 @@ class VCFHandler:
         
         vcf.close()
         
-        self._categorize_variants(variants)
         return variants
-    
-    def _categorize_variants(self, variants: List[Variant]):
-        """Categorize variants by size"""
-        # Clear previous categorizations to prevent accumulation
-        self.variants = {size: [] for size in DeletionSize}
-        for variant in variants:
-            category = variant.size_category
-            self.variants[category].append(variant)
-    
-    def get_variants_by_size(self, size: DeletionSize) -> List[Variant]:
-        """Get variants in a specific size category"""
-        return self.variants.get(size, [])
     
     def get_non_deletion_regions(self, variants: List[Variant], 
                                  anchor_type: str = "up") -> List[Variant]:
@@ -171,7 +130,7 @@ class VCFHandler:
                 del_length = 4 * del_length // 5  # Cap at 80% of original
             
             if anchor_type == "up":
-                start = variant.start - del_length - 150
+                start = max(0, variant.start - del_length - 150)
                 end = start + del_length
             else:  # down anchor
                 start = variant.end + 150
@@ -186,4 +145,3 @@ class VCFHandler:
             anchor_regions.append(anchor)
         
         return anchor_regions
-

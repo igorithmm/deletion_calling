@@ -1,354 +1,443 @@
-# DeepSV2 — Детектирование структурных вариаций (делеций) с помощью глубокого обучения
+# CADC — Context-Aware Deletion Caller
 
-DeepSV2 — это конвейер на базе глубокого обучения для обнаружения **геномных делеций** по данным полногеномного секвенирования (WGS). Система преобразует выровненные прочтения (BAM) в изображения для каждой позиции и обучает сверточную нейронную сеть (CNN) классифицировать каждое геномное окно как **делецию** или **нормальный участок**.
+**CADC** is a deep-learning pipeline for detecting **genomic deletions** from whole-genome sequencing (WGS) data. It converts BAM pileups into RGB images and classifies each 50 bp window as *deletion* or *non-deletion* using a CNN backbone optionally conditioned on HyenaDNA sequence embeddings via **FiLM modulation**.
 
-## Содержание
+Two operating modes are supported:
 
-1. [Обзор алгоритма](#обзор-алгоритма)
-2. [DeepSV 3.0 — FiLM + HyenaDNA](#deepsv-30--film--hyenadna)
-3. [Структура проекта](#структура-проекта)
-4. [Установка](#установка)
-5. [Требования к данным](#требования-к-данным)
-6. [Этапы конвейера](#этапы-конвейера)
-   - [Этап 1: Генерация изображений](#этап-1-генерация-гибридных-данных)
-   - [Этап 2: Обучение модели](#этап-2-обучение-гибридной-модели)
-   - [Этап 3: Инференс (поиск делеций)](#этап-3-инференс-поиск-делеций)
-7. [Примеры использования](#примеры-использования)
-8. [Конфигурация](#конфигурация)
+| Mode | Model | Input | Use case |
+|------|-------|-------|----------|
+| **M0** (RGB-only) | `ModernDeletionCNN` | Pileup image | Fast, no embeddings needed |
+| **M1** (Fused) | `FusedDeepSV` | Pileup image + HyenaDNA embedding | Full context-aware calling |
 
 ---
 
-## Обзор алгоритма
+## Table of Contents
 
-```
-BAM + VCF ──► Генерация изображений ──► Обучение CNN ──► Поиск делеций
-                   │                        │                 │
-            (окна по 50 п.н.)        (Бинарный классификатор) (Вывод в VCF)
-            (pileup → RGB)           (делеция vs норма)
-```
-
-### Основная идея
-
-1. **Извлечение известных делеций** из эталонного VCF-файла (например, вызовы SV из 1000 Genomes Phase 3).
-2. **Для каждой делеции** скользящее окно размером 50 п.н. проходит через регион делеции, генерируя RGB-изображение 256×256 на основе пайлапа (pileup) из BAM-файла. Каждый столбец пикселей представляет одну геномную позицию; каждая строка — одно перекрывающее прочтение. Цвет пикселя кодирует нуклеотид, качество картирования, статус пары прочтений, операции CIGAR и мягкое подрезание (soft-clipping), создавая визуальный «отпечаток» сигнала делеции.
-3. **Генерация соответствующих «нормальных» регионов** (якорных регионов выше и ниже делеции) с использованием того же механизма окон по 50 п.н. Это создает сбалансированные отрицательные примеры.
-4. **Обучение CNN** (архитектура типа AlexNet или современная сеть с BatchNorm) для классификации изображений как `deletion` (метка 1) или `non-deletion` (метка 0).
-5. **На этапе инференса** окно 50 п.н. проходит по геному, классифицирует каждое окно, и соседние положительные предсказания объединяются в вызовы делеций.
+1. [Algorithm Overview](#algorithm-overview)
+2. [FiLM + HyenaDNA (M1 mode)](#film--hyenadna-m1-mode)
+3. [Project Structure](#project-structure)
+4. [Installation](#installation)
+5. [Data Requirements](#data-requirements)
+6. [Pipeline Stages](#pipeline-stages)
+7. [CLI Reference](#cli-reference)
+8. [Python API](#python-api)
+9. [Configuration](#configuration)
 
 ---
 
-## DeepSV 3.0 — FiLM + HyenaDNA
-
-DeepSV 3.0 добавляет **вторую модальность** — замороженные эмбеддинги последовательности от **HyenaDNA-small-32k**, которые сливаются с CNN-признаками через **FiLM-кондиционирование** (Feature-wise Linear Modulation, Perez et al., 2018).
-
-### Зачем это нужно
-
-Базовый CNN (M0) видит только пайлап (выравненные прочтения). Но та же геномная позиция несёт собственный «контекст последовательности» (мотивы, повторы, GC-состав), который частично объясняет, насколько *вероятно* появление сигнала делеции. HyenaDNA-эмбеддинг даёт сжатое (256-мерное) описание этого контекста, и FiLM позволяет ему **переключать** карты признаков CNN на лету, не нарушая исходную архитектуру.
-
-### Идея FiLM
-
-Для карты признаков `F` формы `(B, C, H, W)`:
+## Algorithm Overview
 
 ```
-γ, β = FiLMGenerator(embedding)        # каждое (B, C)
-F_out = F * (1 + γ.view(B, C, 1, 1)) + β.view(B, C, 1, 1)
+BAM + VCF
+    │
+    ▼
+Step 1  Feature extraction      read depth + soft-clipping signals
+Step 2  Breakpoint refinement   3-cluster K-means → exact deletion boundaries
+Step 3  Image generation        50 bp sliding window → 256×256 RGB pileup PNG
+    │
+    ▼  (M1 only)
+HyenaDNA embedding precompute   32 k bp context window → 256-dim vector per 50 bp tile
+    │
+    ▼
+Step 4a Training                M0: ModelTrainer (accuracy)
+                                M1: FiLMTrainer  (F1, two-stage)
+    │
+    ▼
+Step 4b Inference               per-window probabilities → merged DEL calls → VCF
 ```
 
-Каждый `FiLMGenerator` — двухслойный MLP `Linear(256→128) → ReLU → Linear(128→2*C)`. **Финальный Linear инициализируется нулями** (и веса, и смещения), так что в момент `t=0` γ = β = 0 и FiLM **является точным тождеством**: `F_out = F`. Обучение начинается с поведения базового DeepSV и отклоняется от него только по мере того, как FiLM-головы что-то выучивают.
+### Core idea
 
-### Куда внедряется FiLM
+1. **Load known deletions** from a truth VCF (e.g. 1000 Genomes Phase 3 SV calls).
+2. **Slide a 50 bp window** across each deletion, rendering a 256×256 RGB image from the BAM pileup. Each pixel column = one genomic position; each row = one overlapping read. Pixel colour encodes nucleotide, mapping quality, pair status, CIGAR operations, and soft-clipping.
+3. **Generate matching non-deletion windows** (upstream / downstream anchor regions of the same length) as the negative class.
+4. **Train a CNN** to classify each image as `deletion` (label 1) or `non-deletion` (label 0).
+5. **At inference** the window slides across the target genome, classifies each window, and adjacent positive predictions are merged into deletion calls written to VCF.
 
-| Точка | Размерность канала | Внедрение |
-|---|---|---|
-| После блока 1 (`pool1`) | 96 | ✗ слишком низкоуровневые признаки |
-| **После блока 2 (`pool2`)** | **256** | **✓ FiLM** |
-| **После блока 3 (`conv3`)** | **384** | **✓ FiLM** |
-| После блока 4 (`pool4`) | 256 | ✗ пространственная информация уже агрегирована |
+---
 
-### Три модели
+## FiLM + HyenaDNA (M1 mode)
 
-| Имя | Архитектура | Вход | Назначение |
-|---|---|---|---|
-| **M0** | `DeletionCNN` | только изображение | Базовая модель DeepSV |
-| **M1** | `FusedDeepSV` | изображение + эмбеддинг | **Основной вклад** |
-| **M2** | `EmbeddingOnlyMLP` | только эмбеддинг | Sanity-check baseline |
+M1 adds a **second modality**: frozen sequence embeddings from **HyenaDNA-small-32k** fused with CNN features through **FiLM conditioning** (Feature-wise Linear Modulation, Perez et al. 2018).
 
-### Двухстадийное обучение
+### Why it helps
 
-Реализовано в `deepsv/training/film_trainer.py`:
+The baseline CNN (M0) sees only the pileup image. The same genomic position carries its own *sequence context* (motifs, repeats, GC content) that partly explains how likely a deletion signal is. The HyenaDNA embedding provides a compressed 256-dimensional description of this context, and FiLM lets it **modulate CNN feature maps on the fly** without changing the underlying architecture.
 
-* **Стадия A** (по умолчанию 2 эпохи): backbone CNN заморожен, обучаются только FiLM-генераторы. Один param group, lr = **1e-3**.
-* **Стадия B** (оставшиеся эпохи): backbone разморожен, два param group: CNN @ **1e-4**, FiLM @ **1e-3**.
+### FiLM equation
 
-Лучший чекпоинт выбирается по **валидационной F1** (положительный класс), а не по accuracy. Лосс — `nn.CrossEntropyLoss` поверх 2-классового softmax (математически эквивалент BCE для бинарной задачи на 2-логитной голове).
+For a feature map `F` of shape `(B, C, H, W)`:
 
-### Прекомпьют эмбеддингов
+```
+γ, β = FiLMGenerator(embedding)          # each (B, C)
+F_out = F × (1 + γ.view(B,C,1,1)) + β.view(B,C,1,1)
+```
 
-HyenaDNA **никогда не загружается во время обучения**. Один раз заранее запускается:
+Each `FiLMGenerator` is a two-layer MLP `Linear(256→128) → ReLU → Linear(128→2·C)`. **The final Linear is zero-initialised** (weights and biases), so at step 0 γ = β = 0 and FiLM is an **exact identity**: `F_out = F`. Training starts from baseline M0 behaviour and deviates only as the FiLM heads learn.
+
+### Injection points (ModernDeletionCNN)
+
+| Point | Channels | Modulated |
+|-------|----------|-----------|
+| After block 1 (pool1) | 32 | ✗ too low-level |
+| After block 2 (pool2) | 64 | ✗ too low-level |
+| **After block 3 (pool3)** | **128** | **✓ hook3** |
+| **After block 4 (pool4)** | **256** | **✓ hook4** |
+| After block 5 (refinement) | 256 | ✗ spatial info already aggregated |
+
+### Two-stage training
+
+Implemented in `deepsv/training/film_trainer.py`:
+
+- **Stage A** (default 2 epochs): backbone frozen, FiLM generators only. Single param group at `lr_film = 1e-3`.
+- **Stage B** (remaining epochs): backbone unfrozen, two param groups — CNN @ `lr_cnn = 1e-4`, FiLM @ `lr_film = 1e-3`.
+
+Best checkpoint is selected by **validation F1** (positive class), not accuracy. Loss = `nn.CrossEntropyLoss` on the 2-logit softmax head.
+
+### Embedding precompute
+
+HyenaDNA is **never loaded during training**. Run once upfront:
 
 ```bash
 python scripts/precompute_hyenadna_embeddings.py \
-    --fasta raw/hs37d5.fa \
+    --fasta  raw/hs37d5.fa \
     --output data/hyenadna_embeddings.h5 \
     --device cuda \
-    --chrom 20 21 22 \
+    --chrom  20 21 22 \
     --genome-build hs37d5
 ```
 
-Результат — HDF5-файл с layout:
+HDF5 layout:
 
 ```
 /chr1   shape=(n_windows, 256)  dtype=float16   # n_windows = ceil(chrom_len / 50)
 /chr2   ...
 attrs:
-  window_bp    = 50
-  embed_dim    = 256
-  model_id     = LongSafari/hyenadna-small-32k-seqlen-hf
+  window_bp  = 50
+  embed_dim  = 256
+  model_id   = LongSafari/hyenadna-small-32k-seqlen-hf
   ...
 ```
 
-Lookup: `emb = f["chr21"][position // 50]`. Файл открывается **read-only**, и для T4 GPU (16 GB VRAM) хромосомы 20–22 (~1.5 GB) **загружаются в RAM dict** при инициализации `FusedDataset`, чтобы избежать HDF5-чтений в каждом батче. Float16 → float32 cast делается перед входом в модель.
+Lookup: `emb = f["chr21"][position // 50]`. For GPU-constrained nodes, specified chromosomes are preloaded into RAM as a dict at `FusedDataset` init to avoid per-batch HDF5 I/O. float16 → float32 cast happens before the model forward pass.
 
-### Стратифицированная оценка
+### Stratified validation
 
-`FiLMTrainer.validate(...)` поддерживает per-bucket precision/recall/F1/mean-breakpoint-distance по:
+`FiLMTrainer.validate(...)` reports per-bucket precision / recall / F1 across:
 
-* **Длине делеции** (bp): `50–200`, `200–500`, `500–1k`, `1k–5k`, `5k–10k`.
-* **Классу повторов** через пересечение с RepeatMasker BED'ом (`pybedtools`): `unique` / `simple-repeat` / `segmental-dup`.
-
-Стратификация активируется, когда вызывающий код передаёт списки `sample_lengths`, `sample_repeat_classes`, `sample_breakpoint_distances` в `validate(...)`.
-
-### Использование из кода
-
-```python
-from deepsv.models import FusedDeepSV, EmbeddingOnlyMLP, DeletionCNN
-from deepsv.data import FusedDataset
-from deepsv.training import FiLMTrainer
-from deepsv.inference import FusedPredictor
-from torch.utils.data import DataLoader
-
-# Датасет: триплеты (image, embedding, label)
-train_ds = FusedDataset(
-    image_paths=train_images,
-    labels=train_labels,
-    chroms=train_chroms,                  # per-sample chromosome
-    positions=train_positions,            # per-sample window centre (bp)
-    embeddings_h5="data/hyenadna_embeddings.h5",
-    preload_chroms=["chr20", "chr21", "chr22"],
-    transform=image_transform,
-)
-train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4)
-
-# Модель + тренер
-model = FusedDeepSV(embed_dim=256, num_classes=2)
-trainer = FiLMTrainer(model)
-trainer.train(
-    train_loader=train_loader,
-    val_loader=val_loader,
-    num_epochs=10,
-    stage_a_epochs=2,
-    lr_cnn=1e-4,
-    lr_film=1e-3,
-    save_path="models/fused_deepsv_best.pth",
-)
-
-# Инференс
-predictor = FusedPredictor(
-    model=model,
-    embeddings_h5="data/hyenadna_embeddings.h5",
-    threshold=0.5,
-    preload_chroms=["chr20", "chr21", "chr22"],
-)
-prob, pred_class = predictor.predict("data/window.png", chrom="chr21", position=14400000)
-```
+- **Deletion length**: `50–200`, `200–500`, `500–1k`, `1k–5k`, `5k–10k` bp.
 
 ---
 
-## Структура проекта
+## Project Structure
 
 ```
-deepsv2/
-├── deepsv/                          # Основная библиотека
+cadc/
+├── deepsv/                          # Core library (package name kept for compatibility)
 │   ├── data/
-│   │   ├── bam_handler.py           # Работа с BAM: пайлап, покрытие, клиппирование
-│   │   ├── vcf_handler.py           # Работа с VCF: загрузка вариантов, категории размеров
-│   │   ├── genomic_context.py       # DNABERT-2 эмбеддер + PCA (DeepSV 2.5)
-│   │   └── fused_dataset.py         # (3.0) FusedDataset: (image, HyenaDNA emb, label)
+│   │   ├── bam_handler.py           # BAM: pileup, coverage depth, soft-clipping
+│   │   ├── vcf_handler.py           # VCF: variant loading, non-deletion anchor generation
+│   │   └── fused_dataset.py         # FusedDataset: (image, HyenaDNA emb, label) triples
 │   ├── visualization/
-│   │   └── image_generator.py       # Конвертация пайлапа в RGB-изображение 256×256
+│   │   └── image_generator.py       # Pileup → 256×256 RGB image
 │   ├── models/
-│   │   ├── cnn.py                   # DeletionCNN (M0, AlexNet-like) и ModernDeletionCNN
-│   │   ├── multichannel_cnn.py      # BroadcastContextCNN для 11-канального входа (2.5)
-│   │   ├── film.py                  # (3.0) FiLMGenerator + apply_film
-│   │   └── fused_cnn.py             # (3.0) FusedDeepSV (M1) + EmbeddingOnlyMLP (M2)
+│   │   ├── cnn.py                   # ModernDeletionCNN (M0 backbone)
+│   │   ├── film.py                  # FiLMGenerator + apply_film
+│   │   └── fused_cnn.py             # FusedDeepSV (M1): CNN + FiLM injection
 │   ├── training/
-│   │   ├── trainer.py               # Базовый ModelTrainer (M0, accuracy-based)
-│   │   └── film_trainer.py          # (3.0) FiLMTrainer: 2 стадии, F1-best, стратификация
+│   │   ├── trainer.py               # ModelTrainer: M0 accuracy-based training
+│   │   └── film_trainer.py          # FiLMTrainer: two-stage, F1-best, stratified eval
 │   ├── inference/
-│   │   ├── predictor.py             # Базовый DeletionPredictor (M0)
-│   │   └── fused_predictor.py       # (3.0) FusedPredictor: image + embedding lookup
+│   │   ├── predictor.py             # DeletionPredictor: M0 image-only inference
+│   │   └── fused_predictor.py       # FusedPredictor: M1 image + embedding lookup
 │   ├── processing/
-│   │   ├── candidate_detector.py    # Поиск кандидатов (K-means на глубине и клиппировании)
-│   │   └── refinement.py            # Уточнение границ делеций через K-means
+│   │   └── refinement.py            # BoundaryRefiner: K-means breakpoint refinement
 │   └── utils/
-│       ├── vcf_writer.py            # Генерация выходного VCF
-│       └── kmeans.py                # Реализация алгоритма K-means
+│       └── kmeans.py                # Custom K-means implementation
 │
-├── scripts/                         # Запускаемые скрипты
-│   ├── generate_image_tensor_dataset.py    # DeepSV 2.5: RGB + DNABERT-2 контекст
-│   ├── precompute_hyenadna_embeddings.py   # (3.0) Прекомпьют HyenaDNA → HDF5
-│   ├── precompute_dnabert2_embeddings.py   # Прекомпьют DNABERT-2 эмбеддингов
-│   ├── train_model.py                      # Цикл обучения
-│   ├── call_deletions.py                   # Инференс: изображения → вызовы в VCF
-│   ├── check_bam_header.py                 # Утилита для проверки заголовка BAM
-│   └── slurm/                              # SLURM-скрипты для кластерных запусков
+├── scripts/
+│   ├── generate_fused_dataset.py    # Steps 1–3: BAM+VCF → images + manifest CSV
+│   ├── precompute_hyenadna_embeddings.py  # HyenaDNA → HDF5 embedding store
+│   ├── train_fused_model.py         # Step 4a: train M0 or M1
+│   ├── call_fused_deletions.py      # Step 4b: inference → predictions CSV + VCF
+│   ├── run_fused_pipeline.sh        # End-to-end driver (all 4 stages)
+│   ├── test_raw_e2e.py              # End-to-end sanity test on real BAM/VCF
+│   └── slurm/                       # SLURM job scripts for cluster runs
 │
-├── raw/                             # Исходные данные (BAM, VCF и индексы)
-├── data/                            # Сгенерированные изображения + HDF5 с эмбеддингами
-├── models/                          # Чекпоинты обученных моделей
-├── tests/                           # Юнит-тесты
+├── raw/                             # Input data: BAM, VCF, FASTA (user-provided)
+├── data/                            # Generated: images, manifest CSV, HDF5 embeddings
+├── models/                          # Saved model checkpoints
 ├── requirements.txt
 └── setup.py
 ```
 
 ---
 
-## Установка
+## Installation
 
 ```bash
-# Клонирование и установка зависимостей
+# Clone and install dependencies
+git clone <repo-url> cadc
+cd cadc
 pip install -r requirements.txt
-
-# Необходимые пакеты:
-# - pysam              (чтение BAM/VCF)
-# - numpy, pandas      (обработка данных)
-# - Pillow             (создание изображений)
-# - torch, torchvision (обучение и инференс CNN)
-# - scikit-learn, scipy (анализ данных и K-means)
-# - transformers       (DNABERT-2 / HyenaDNA загрузка)
-# - h5py, pyfaidx      (DeepSV 3.0: прекомпьют и хранение эмбеддингов)
-# - pybedtools         (DeepSV 3.0: стратификация по повторам — опционально)
 ```
+
+**Dependencies:**
+
+| Package | Purpose |
+|---------|---------|
+| `torch`, `torchvision` | CNN training and inference |
+| `pysam` | BAM/VCF reading (pileup, genotype filtering) |
+| `pyfaidx` | FASTA chunking for embedding precompute |
+| `numpy`, `scipy` | Numerical computing, rolling median |
+| `scikit-learn` | Metrics (F1, AUC), class-weight computation |
+| `Pillow` | PNG image generation |
+| `tqdm` | Progress bars |
+| `transformers`, `huggingface-hub`, `einops` | HyenaDNA model loading |
+| `h5py` | Precomputed embedding store |
 
 ---
 
-## Требования к данным
+## Data Requirements
 
-| Файл | Описание |
+| File | Description |
 |------|-------------|
-| `raw/*.bam` + `*.bam.bai` | Выровненные WGS прочтения (например, NA12878) |
-| `raw/*.vcf.gz` + `*.vcf.gz.tbi` | Эталонный VCF с SV (например, 1000 Genomes Phase 3) |
+| `raw/*.bam` + `*.bam.bai` | Aligned WGS reads (e.g. NA12878 low-coverage) |
+| `raw/*.vcf.gz` + `*.vcf.gz.tbi` | Truth SV VCF (e.g. 1000 Genomes Phase 3) |
+| `raw/*.fa` + `*.fa.fai` | Reference FASTA — only needed for M1 precompute |
 
-VCF должен содержать записи с `SVTYPE=DEL` или `ALT=<DEL>`. Конвейер фильтрует только делеции и игнорирует другие типы структурных вариаций.
-
----
-
-## Этапы конвейера
-
-### Этап 1: Генерация гибридных данных
-
-**Скрипт**: `scripts/generate_image_tensor_dataset.py`
-
-Это основной скрипт для подготовки данных (версия DeepSV 2.5). Он генерирует сбалансированный набор, состоящий из 3-канальных RGB-изображений и 8-канальных контекстных эмбеддингов DNABERT-2 (в сумме 11 каналов). Исключает половые хромосомы и отфильтровывает VERY_LARGE делеции.
-
-#### Изображения делеций (Положительный класс, label=1)
-
-1. Загрузка вариантов делеций из VCF с фильтрацией по:
-   - Типу (`SVTYPE=DEL`) и генотипу образца.
-   - Максимальной длине (`--max-length`, по умолчанию 10,000 п.н. — для пропуска аномально длинных СВ).
-   - Хромосоме (`--chroms`).
-2. **Уточнение границ (Refinement)**: Скрипт использует K-means для анализа глубины покрытия и сигналов клиппирования, чтобы найти точные границы делеции перед созданием изображений.
-3. Для каждой делеции создаются окна по **50 п.н.** от начала до конца. Каждое окно становится отдельным PNG-изображением.
-
-#### Изображения без делеций (Отрицательный класс, label=0)
-
-1. Для каждой делеции вычисляются «якорные» регионы (anchor regions) выше (up) и ниже (down) по течению.
-2. Эти регионы разбиваются на такие же окна по 50 п.н., обеспечивая идеальный баланс классов.
-
-#### Режимы представления (Representation)
-
-Пайплайн DeepSV 2.5 использует гибридное представление (Hybrid Mode):
-- `standard`: Цвета нуклеотидов (A=красный, T=зеленый, C=синий, G=черный) корректируются в зависимости от качества картирования, статуса пары и CIGAR-операций (3 канала).
-- `context`: Дополнительный тензор, полученный через извлечение свойств последовательности моделью **DNABERT-2**, сжатый методом PCA до 8 компонент. Итоговое представление имеет 11 каналов.
-(Режим `kmer` признан устаревшим и был удален).
-
-#### Пример команды
-```bash
-python3 scripts/generate_dataset.py --sample NA12878 --mode standard --chroms 1,2,3
-```
+The VCF must contain records with `SVTYPE=DEL` or `ALT=<DEL>`. The pipeline filters for deletions only and ignores other SV types.
 
 ---
 
-### Этап 2: Обучение гибридной модели
+## Pipeline Stages
 
-**Скрипт**: `scripts/train_image_tensor_model.py`
-
-#### Архитектура: Оптимизированная гибридная CNN
-
-Сеть CNN, принимающая на вход 11-канальный тензор:
-- Два слоя Conv2d(3×3) с BatchNorm и LeakyReLU(0.1) в каждом блоке.
-- MaxPool2d(2×2) для понижения размерности.
-- Финальный классификатор: Flatten → Linear → ReLU → Dropout(0.3) → Linear(2).
-
-#### Процесс обучения
-
-1. **Разделение по хромосомам**: Обучение обычно идет на хромосомах 1-11, валидация — на 12-22. Это гарантирует, что модель учится общим биологическим паттернам, а не специфике конкретных участков.
-2. **Аугментация**: Случайные горизонтальные перевороты и повороты (±10°) для повышения устойчивости модели.
-3. **Мониторинг**: Скрипт строит графики потерь (loss), точности (Balanced Accuracy), F1-меры и ROC-кривые в реальном времени.
-
-#### Пример команды
-```bash
-# Использование скрипта полного цикла Pipeline
-./scripts/train_sv2_5_balanced_no_sex.sh
-```
-
----
-
-### Этап 3: Инференс (поиск делеций)
-
-**Скрипт**: `scripts/call_deletions.py`
-
-1. Загрузка весов обученной модели (`best_model.pth`).
-2. Для каждого изображения в папке:
-   - Проход через нейросеть → вероятность наличия делеции.
-   - Если P(deletion) > порога (например, 0.5) → запись вызова.
-3. Координаты извлекаются из имен файлов.
-4. Результат сохраняется в формате VCF.
-
----
-
-## Примеры использования
-
-### Быстрый запуск конвейера (DeepSV 2.5)
+### Stage 0 — Precompute HyenaDNA embeddings *(M1 only)*
 
 ```bash
-# Запуск полного конвейера (генерация, PCA-адаптация, обучение)
-chmod +x scripts/train_sv2_5_balanced_no_sex.sh
-./scripts/train_sv2_5_balanced_no_sex.sh
+python scripts/precompute_hyenadna_embeddings.py \
+    --fasta  raw/hs37d5.fa \
+    --output data/hyenadna_embeddings.h5 \
+    --device cuda \
+    --chrom  20 21 22 \
+    --genome-build hs37d5 \
+    --resume          # skip chromosomes already present in the HDF5
 ```
+
+Run once per reference genome. Output is reusable across samples. Uses 30 kbp core chunks with 1 kbp flanks (32 kbp total input) to fit HyenaDNA's 32 k context window.
 
 ---
 
-## Конфигурация
+### Stage 1–3 — Generate dataset
 
-| Параметр | По умолчанию | Описание |
-|-----------|---------|-------------|
-| `--max-length` | 10000 | Пропускать делеции длиннее этого значения (п.н.) |
-| `--mode` | `hybrid` | Режим работы: `standard` или `hybrid` (устаревший `kmer` удален) |
-| `--del-count` | 2000 | Целевое количество изображений делеций на хромосому |
-| `--epochs` | 20 | Количество эпох обучения |
-| `--batch-size` | 32 | Размер батча (для DeepSV 3.0 — 128 по спецификации) |
-| `--train-chroms` | 1-11 | Хромосомы для обучающей выборки |
-| `--val-chroms` | 12-22 | Хромосомы для валидационной выборки |
+```bash
+python scripts/generate_fused_dataset.py \
+    --sample NA12878 \
+    --bam    raw/NA12878.bam \
+    --vcf    raw/truth.vcf.gz \
+    --chroms 20,21,22 \
+    --max-length 10000 \
+    --del-count  500 \           # optional: cap deletions per chromosome
+    --output-dir data/fused
+```
 
-### Параметры DeepSV 3.0 (FiLM)
+**What it does:**
 
-| Параметр (`FiLMTrainer.train`) | По умолчанию | Описание |
-|---|---|---|
-| `num_epochs` | 10 | Общее число эпох (Stage A + Stage B) |
-| `stage_a_epochs` | 2 | Сколько эпох обучать только FiLM (backbone заморожен) |
-| `lr_film` | 1e-3 | Learning rate для FiLM-генераторов в обеих стадиях |
-| `lr_cnn` | 1e-4 | Learning rate для backbone CNN (только Stage B) |
-| `weight_decay` | 1e-6 | L2-регуляризация |
-| `save_path` | — | Путь для лучшего чекпоинта (по валидационной F1) |
-| `validate_kwargs` | `{}` | Опциональные `sample_lengths` / `sample_repeat_classes` / `sample_breakpoint_distances` для стратификации |
+1. Loads deletions from VCF, filters by chromosome and length.
+2. Refines each deletion's breakpoints using 3-cluster K-means on coverage depth + soft-clipping signals (61 bp rolling median pre-smoothed).
+3. Slides a 50 bp window across each deletion → 256×256 RGB pileup PNG → manifest row.
+4. Generates upstream and downstream non-deletion anchor windows (same length) as the negative class.
+
+**Output:** `data/fused/NA12878/manifest.csv` with columns `image_path, chrom, position, label, length`.
+
+---
+
+### Stage 4a — Train
+
+```bash
+# M0: RGB-only baseline
+python scripts/train_fused_model.py \
+    --manifest data/fused/NA12878/manifest.csv \
+    --model cnn \
+    --train-chroms 20,21 --val-chroms 22 \
+    --output models/m0_best.pth \
+    --epochs 10
+
+# M1: Fused (image + HyenaDNA FiLM)
+python scripts/train_fused_model.py \
+    --manifest     data/fused/NA12878/manifest.csv \
+    --model        fused \
+    --embeddings   data/hyenadna_embeddings.h5 \
+    --train-chroms 20,21 --val-chroms 22 \
+    --output       models/m1_best.pth \
+    --epochs       10 \
+    --stage-a-epochs 2 \
+    --lr-cnn  1e-4 \
+    --lr-film 1e-3
+```
+
+The chromosome split ensures the model learns general biological patterns rather than region-specific features.
+
+---
+
+### Stage 4b — Inference
+
+```bash
+# M0 inference
+python scripts/call_fused_deletions.py \
+    --manifest        data/fused/NA12878/manifest.csv \
+    --model           cnn \
+    --checkpoint      models/m0_best.pth \
+    --predictions-out runs/m0_predictions.csv \
+    --vcf-out         runs/m0_calls.vcf
+
+# M1 inference
+python scripts/call_fused_deletions.py \
+    --manifest        data/fused/NA12878/manifest.csv \
+    --model           fused \
+    --checkpoint      models/m1_best.pth \
+    --embeddings      data/hyenadna_embeddings.h5 \
+    --predictions-out runs/m1_predictions.csv \
+    --vcf-out         runs/m1_calls.vcf \
+    --threshold       0.5
+```
+
+Adjacent positive windows on the same chromosome are merged into single deletion calls. The output VCF contains `SVTYPE=DEL`, `END`, `SVLEN`, `NWIN` (number of merged windows), and `MAXPROB` (max deletion probability).
+
+---
+
+### Full pipeline (one command)
+
+```bash
+./scripts/run_fused_pipeline.sh \
+    --sample       NA12878 \
+    --bam          raw/NA12878.bam \
+    --vcf          raw/truth.vcf.gz \
+    --fasta        raw/hs37d5.fa \
+    --model        fused \
+    --chroms       20,21,22 \
+    --train-chroms 20,21 \
+    --val-chroms   22 \
+    --out-root     runs/experiment1
+```
+
+Use `--skip-precompute`, `--skip-generate`, `--skip-train`, `--skip-infer` to resume from an intermediate stage.
+
+---
+
+## CLI Reference
+
+### `generate_fused_dataset.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--sample` | *required* | Sample ID (used for output directory naming) |
+| `--bam` | *required* | Indexed BAM file |
+| `--vcf` | *required* | Indexed VCF.gz with SV calls |
+| `--chroms` | *required* | Comma-separated chromosomes (e.g. `20,21,22`) |
+| `--output-dir` | `data/fused` | Root directory for images + manifest |
+| `--max-length` | `10000` | Skip deletions longer than this (bp) |
+| `--min-length` | `50` | Skip deletions shorter than this (bp) |
+| `--del-count` | *none* | Optional cap on deletions per chromosome |
+| `--no-refine` | *off* | Skip K-means breakpoint refinement |
+| `--seed` | `42` | Random seed for per-chromosome capping |
+
+### `train_fused_model.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--manifest` | *required* | CSV from `generate_fused_dataset.py` |
+| `--model` | `fused` | `cnn` (M0) or `fused` (M1) |
+| `--embeddings` | *none* | HDF5 embedding file (required for `--model fused`) |
+| `--output` | *required* | Path to save best checkpoint |
+| `--train-chroms` | *required* | Comma-separated training chromosomes |
+| `--val-chroms` | *required* | Comma-separated validation chromosomes |
+| `--epochs` | `10` | Total training epochs |
+| `--stage-a-epochs` | `2` | FiLM-only warm-up epochs (M1 only) |
+| `--batch-size` | `128` | Batch size |
+| `--lr-cnn` | `1e-4` | CNN backbone learning rate (Stage B) |
+| `--lr-film` | `1e-3` | FiLM generator learning rate (both stages) |
+| `--weight-decay` | `1e-6` | L2 regularisation |
+| `--embed-dim` | `256` | HyenaDNA embedding dimension |
+
+### `call_fused_deletions.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--manifest` | *required* | CSV from `generate_fused_dataset.py` |
+| `--checkpoint` | *required* | Trained model state dict |
+| `--model` | `fused` | `cnn` or `fused` |
+| `--embeddings` | *none* | HDF5 file (required for `--model fused`) |
+| `--predictions-out` | *required* | Output CSV with per-window probabilities |
+| `--vcf-out` | *none* | Optional VCF with merged DEL calls |
+| `--threshold` | `0.5` | P(deletion) threshold for positive classification |
+| `--batch-size` | `64` | Inference batch size |
+| `--embed-dim` | `256` | Must match training value |
+
+---
+
+## Python API
+
+```python
+from deepsv.models import ModernDeletionCNN, FusedDeepSV
+from deepsv.data import FusedDataset
+from deepsv.training import FiLMTrainer
+from deepsv.training.trainer import ImageDataset, ModelTrainer
+from deepsv.inference import FusedPredictor
+from deepsv.inference.predictor import DeletionPredictor
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# ── M0: RGB-only ──────────────────────────────────────────────────────────
+
+train_ds = ImageDataset(image_paths=train_paths, labels=train_labels, transform=transform)
+model_m0 = ModernDeletionCNN(num_classes=2)
+trainer_m0 = ModelTrainer(model_m0)
+trainer_m0.setup_optimizer(learning_rate=1e-4)
+trainer_m0.train(
+    train_loader=DataLoader(train_ds, batch_size=128, shuffle=True),
+    num_epochs=10,
+    save_path="models/m0_best.pth",
+)
+
+# ── M1: Fused (image + HyenaDNA) ─────────────────────────────────────────
+
+train_ds = FusedDataset(
+    image_paths=train_paths,
+    labels=train_labels,
+    chroms=train_chroms,
+    positions=train_positions,
+    embeddings_h5="data/hyenadna_embeddings.h5",
+    preload_chroms=["20", "21"],
+    transform=transform,
+)
+model_m1 = FusedDeepSV(embed_dim=256, num_classes=2)
+trainer_m1 = FiLMTrainer(model_m1)
+trainer_m1.train(
+    train_loader=DataLoader(train_ds, batch_size=128, shuffle=True),
+    val_loader=val_loader,
+    num_epochs=10,
+    stage_a_epochs=2,
+    lr_cnn=1e-4,
+    lr_film=1e-3,
+    save_path="models/m1_best.pth",
+)
+
+# ── Inference ─────────────────────────────────────────────────────────────
+
+with FusedPredictor(
+    model=model_m1,
+    embeddings_h5="data/hyenadna_embeddings.h5",
+    threshold=0.5,
+    preload_chroms=["22"],
+) as predictor:
+    results = predictor.predict_batch(
+        image_paths=paths, chroms=chroms, positions=positions
+    )
+```

@@ -103,6 +103,12 @@ class FusedPredictor:
         window_idx = int(position) // self.window_size
         if chrom in self._cache:
             arr = self._cache[chrom]
+            if window_idx < 0 or window_idx >= arr.shape[0]:
+                raise IndexError(
+                    f"window_idx={window_idx} out of range for {chrom} "
+                    f"(n_windows={arr.shape[0]}); position={position}, "
+                    f"window_size={self.window_size}."
+                )
             return arr[window_idx].astype(np.float32, copy=False)
         if self._h5 is None:
             raise RuntimeError("FusedPredictor: HDF5 file is closed.")
@@ -111,6 +117,13 @@ class FusedPredictor:
                 list(self._h5.keys()), chrom
             )
         key = self._chrom_key_map[chrom]
+        n_windows = self._h5[key].shape[0]
+        if window_idx < 0 or window_idx >= n_windows:
+            raise IndexError(
+                f"window_idx={window_idx} out of range for {chrom} "
+                f"(n_windows={n_windows}); position={position}, "
+                f"window_size={self.window_size}."
+            )
         return self._h5[key][window_idx].astype(np.float32, copy=False)
 
     # ------------------------------------------------------------------
