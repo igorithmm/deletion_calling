@@ -4,6 +4,21 @@ from PIL import Image, ImageDraw
 from dataclasses import dataclass
 
 
+# Which RGB channels are "non-primary" for each base.
+# Legacy only applies the clipping adjustment to these channels,
+# leaving the primary (255) channel untouched.
+#   A (Red):   primary = R(0), non-primary = G(1), B(2)
+#   T (Green): primary = G(1), non-primary = R(0), B(2)
+#   C (Blue):  primary = B(2), non-primary = R(0), G(1)
+#   G (Black): ALL channels are non-primary (all start at 0)
+_NON_PRIMARY_CHANNELS: Dict[str, Tuple[int, ...]] = {
+    'A': (1, 2),
+    'T': (0, 2),
+    'C': (0, 1),
+    'G': (0, 1, 2),
+}
+
+
 @dataclass
 class BaseColor:
     """Base color configuration for nucleotides"""
@@ -37,7 +52,9 @@ class ImageGenerator:
 
         Args:
             pileup_data: List of (pos, is_paired, is_proper_pair, mapq, cigar_type, base)
-            clipping_data: Dictionary mapping position to clipping count
+            clipping_data: Dictionary mapping position to clipping signal
+                (from ``BAMHandler.get_clipping_info``; values are typically
+                negative — the legacy pipeline negates them before applying).
             region_start: Start position of the region
             region_length: Length of the region
 
@@ -66,8 +83,11 @@ class ImageGenerator:
             x_end = x_start + self.pixel_size
             y_end = y_start + self.pixel_size
 
-            # Get clipping value for this position
-            clip_value = clipping_data.get(pos, 0)
+            # Get clipping value for this position.
+            # Legacy passes ``-clip_dict_record[pos]`` to get_rgb, i.e. the
+            # stored (negative) value is negated so the effective clip_value
+            # applied to channels is positive.  We replicate that here.
+            clip_value = -clipping_data.get(pos, 0)
 
             # Get RGB color based on base and read properties
             rgb = self._get_base_color(
@@ -89,7 +109,18 @@ class ImageGenerator:
                        cigar_type: int,
                        clip_value: int) -> Tuple[int, int, int]:
         """
-        Calculate RGB color for a base based on its properties
+        Calculate RGB color for a base based on its properties.
+
+        Matches the legacy ``get_rgb()`` colour formation:
+        1. Start from the base colour (A=Red, T=Green, C=Blue, G=Black).
+        2. Compute a quality offset from the 4 read-property flags and add
+           it to **all** channels (for A/T/C the primary channel is already
+           255 so ``min(255, 255+offset) == 255`` — no visible change on
+           the primary channel, matching legacy which only wrote the offset
+           into non-primary channels explicitly).
+        3. Apply the clipping value to **non-primary channels only**, as
+           the legacy code did (e.g. for base A it touched G and B but
+           *not* R).
 
         Args:
             base: Nucleotide base (A, T, C, G)
@@ -97,7 +128,8 @@ class ImageGenerator:
             is_proper_pair: Whether pair is proper
             mapq: Mapping quality
             cigar_type: CIGAR operation type
-            clip_value: Clipping value
+            clip_value: Clipping value (already negated by caller so that
+                positive = lighten non-primary channels)
 
         Returns:
             RGB tuple
@@ -114,8 +146,11 @@ class ImageGenerator:
             )
             base_color = [min(255, c + offset) for c in base_color]
 
-        # Add clipping value
-        base_color = [min(255, max(0, c + clip_value)) for c in base_color]
+        # Apply clipping value to non-primary channels only (legacy behaviour).
+        # For G (Black) all three channels are non-primary.
+        non_primary = _NON_PRIMARY_CHANNELS.get(base, (0, 1, 2))
+        for ch in non_primary:
+            base_color[ch] = min(255, max(0, base_color[ch] + clip_value))
 
         return tuple(base_color)
 

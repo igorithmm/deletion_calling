@@ -2,6 +2,7 @@
 from typing import List, Tuple, Optional
 import pysam
 import numpy as np
+import pandas as pd
 
 
 class BAMHandler:
@@ -48,51 +49,102 @@ class BAMHandler:
     
     def get_clipping_info(self, chrom: str, start: int, end: int) -> dict:
         """
-        Extract soft-clipping information for a region
-        
+        Extract clipping/mapping-anomaly signal for a region.
+
+        Replicates the legacy ``get_clip_num()`` algorithm exactly:
+
+        1. For every read overlapping [start, end], determine the CIGAR
+           operation type at each genomic position using the legacy walk
+           (cumulative length vs genomic position — always yields the
+           *last* CIGAR operation whose cumulative length is still less
+           than the genomic position).
+        2. Accumulate ``-map_type`` per position across all reads.
+        3. Integer-divide the per-position sum by 4.
+
+        The resulting values are typically negative (dominated by soft-clip
+        op=4 contributing −4 each).  The image generator negates them
+        before applying to pixel channels.
+
         Args:
             chrom: Chromosome name
-            start: Start position
-            end: End position
-            
+            start: Start position (inclusive)
+            end: End position (exclusive in pysam, but legacy used inclusive
+                 — we add 1 internally to match)
+
         Returns:
-            Dictionary mapping position to clipping count
+            Dictionary mapping position → clipping signal value
         """
         if not self._bam_file:
             raise RuntimeError("BAM file not opened. Use context manager.")
-        
-        from collections import defaultdict
-        clip_counts = defaultdict(int)
+
+        clip_temp: List[Tuple[int, int]] = []
+
         for read in self._bam_file.fetch(chrom, start, end):
-            if not read.cigartuples:
+            if read.cigarstring is None:
                 continue
-            
-            # Check for soft/hard clips at the alignment boundaries
-            first_op, _ = read.cigartuples[0]
-            last_op, _ = read.cigartuples[-1]
-            
-            if first_op in (4, 5):
-                pos = read.reference_start
-                if start <= pos < end:
-                    clip_counts[pos] += 1
-                    
-            if last_op in (4, 5) and read.reference_end is not None:
-                pos = read.reference_end - 1
-                if start <= pos < end:
-                    clip_counts[pos] += 1
-                    
-        return dict(clip_counts)
-    
+
+            # Determine effective read span the same way legacy did:
+            #   base_pos = read.get_reference_positions(full_length=True)
+            #   count leading Nones → soft-clipped query bases at the start
+            #   read_start = reference_start - leading_nones
+            #   read_end   = read_start + read_len - 1
+            base_pos = read.get_reference_positions(full_length=True)
+            read_len = len(base_pos)
+
+            leading_nones = 0
+            for p in base_pos:
+                if p is not None:
+                    break
+                leading_nones += 1
+
+            read_start = read.reference_start - leading_nones
+            read_end = read_start + read_len - 1
+
+            # For every position in the query window that this read covers,
+            # walk the CIGAR to find map_type using legacy logic.
+            for i in range(end - start):
+                pos = start + i
+                if pos < read_start or pos > read_end:
+                    continue
+
+                # Legacy CIGAR walk: compare *genomic position* against a
+                # cumulative CIGAR-length counter starting at 0.  Because
+                # genomic positions are much larger than read lengths, this
+                # effectively always selects the last CIGAR operation.
+                index_ptr = 0
+                map_type = -1
+                for cigar_op, cigar_len in read.cigartuples:
+                    if pos > index_ptr:
+                        index_ptr = cigar_len + index_ptr
+                        map_type = cigar_op
+
+                clip_temp.append((pos, -map_type))
+
+        if not clip_temp:
+            return {}
+
+        clip_record_np = np.array(clip_temp)
+        df = pd.DataFrame(clip_record_np, columns=[0, 1])
+        clip_record_df = df.groupby(0)[1].sum()
+        clip_record_df = clip_record_df // 4
+        temp = clip_record_df.reset_index()
+        clip_record = np.array(temp).tolist()
+        return {int(row[0]): int(row[1]) for row in clip_record}
+
     def _get_cigar_at_position(self, read: pysam.AlignedSegment, query_pos: int) -> int:
-        """Get CIGAR operation type at a query position"""
+        """Get CIGAR operation type at a query position.
+
+        Replicates the legacy ``pipeup_column`` CIGAR walk: advance a
+        cumulative index by **every** CIGAR operation length (not only
+        query-consuming ones) and compare against ``query_position``.
+        """
         index = 0
+        map_type = -1
         for op, length in read.cigartuples:
-            consumes_query = op in (0, 1, 4, 7, 8)  # M, I, S, =, X
-            if consumes_query:
-                if query_pos < index + length:
-                    return op
-                index += length
-        return -1
+            if query_pos > index:
+                index = length + index
+                map_type = op
+        return map_type
     
     def get_pileup_data(self, chrom: str, start: int, end: int) -> List[Tuple]:
         """

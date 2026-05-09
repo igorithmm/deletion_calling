@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 from deepsv.data.bam_handler import BAMHandler
 from deepsv.data.vcf_handler import Variant
 from deepsv.utils.kmeans import kmeans
@@ -15,16 +15,23 @@ class BoundaryRefiner:
         self.k = k
         self.max_iterations = max_iterations
 
-    def refine_boundaries(self, bam_handler: BAMHandler, variant: Variant) -> Variant:
+    def refine_boundaries(self, bam_handler: BAMHandler, variant: Variant) -> Optional[Variant]:
         """
-        Refine the start and end coordinates of a deletion variant
-        
+        Refine the start and end coordinates of a deletion variant.
+
+        Mirrors the legacy ``call_del`` logic: if the K-means analysis does
+        not confirm a clear deletion signal the candidate is **rejected**
+        and ``None`` is returned.  Only candidates whose depth profile
+        contains a cluster significantly lower than the others AND whose
+        deletion cluster does not span the entire analysis window are kept.
+
         Args:
             bam_handler: Open BAMHandler instance
             variant: The variant to refine
-            
+
         Returns:
-            New Variant with potentially adjusted coordinates
+            Refined Variant, or ``None`` if the deletion signal could not
+            be confirmed (candidate should be dropped).
         """
         # Original logic uses a 200bp padding window for analysis
         # "int(vcf_del[i][1]-200), int(vcf_del[i][2]+200)"
@@ -40,14 +47,14 @@ class BoundaryRefiner:
             depth_data = bam_handler.get_coverage_depth(chrom, analyze_start, analyze_end)
         except Exception as e:
             logger.warning(f"Could not get coverage for refinement: {e}")
-            return variant
+            return None
 
         # 2. Get clipping info
         try:
             clip_dict = bam_handler.get_clipping_info(chrom, analyze_start, analyze_end)
         except Exception as e:
             logger.warning(f"Could not get clipping info for refinement: {e}")
-            return variant
+            return None
 
         # Prepare features for initial 1D K-means (Depth only)
         # Old code: seq_depth array [(pos, depth), ...]
@@ -100,7 +107,7 @@ class BoundaryRefiner:
         # This removes the NaN/boundary effects of the rolling window
         trim = 30
         if len(positions) <= 2 * trim:
-             return variant # Too short
+             return None  # Too short to analyse
              
         valid_indices = slice(trim, -trim)
         
@@ -127,7 +134,9 @@ class BoundaryRefiner:
             
         # Need exactly 3 clusters for logic to work implicitly
         if len(clusters) < 3:
-            return variant
+            logger.debug("fewer than 3 clusters — rejecting candidate %s:%d-%d",
+                         chrom, variant.start, variant.end)
+            return None
             
         # Calculate stats for logic
         # "class_one_3D_mean = np.mean(class_one_3D[:,1])//5"
@@ -151,7 +160,7 @@ class BoundaryRefiner:
             all_indices.discard(max_idx)
             if not all_indices:
                 # All clusters have same mean — can't distinguish deletion
-                return variant
+                return None
             mid_idx = all_indices.pop()
             
             deletion_cluster = clusters[min_idx]
@@ -217,5 +226,8 @@ class BoundaryRefiner:
                     sv_type=variant.sv_type
                 )
         
-        # Fallback if conditions not met
-        return variant
+        # Fallback: K-means did not confirm deletion signal — reject candidate
+        # (mirrors legacy call_del which only appended to del_pos on success)
+        logger.debug("K-means did not confirm deletion at %s:%d-%d — rejecting",
+                     chrom, variant.start, variant.end)
+        return None

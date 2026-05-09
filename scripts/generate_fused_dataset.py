@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import numpy as np
 import random
 import sys
 from dataclasses import dataclass, field
@@ -75,9 +76,9 @@ WINDOW_BP = 50  # window size — must match the embeddings precompute
 # ─────────────────────────────────────────────────────────────────────────────
 # Mixed-strategy target ratios (E3)
 # ─────────────────────────────────────────────────────────────────────────────
-ANCHOR_RATIO   = 0.40
+ANCHOR_RATIO = 0.40
 REGIONAL_RATIO = 0.30
-RANDOM_RATIO   = 0.30
+RANDOM_RATIO = 0.30
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,11 +89,12 @@ RANDOM_RATIO   = 0.30
 @dataclass
 class WindowRecord:
     """One row in the manifest CSV."""
+
     image_path: str
     chrom: str
-    position: int       # 0-based start of the 50-bp window
-    label: int          # 1 = deletion, 0 = non-deletion
-    length: int         # parent variant length (bp)
+    position: int  # 0-based start of the 50-bp window
+    label: int  # 1 = deletion, 0 = non-deletion
+    length: int  # parent variant length (bp)
     neg_type: str = ""  # "anchor" | "regional" | "random" | "" (positives)
 
 
@@ -132,9 +134,7 @@ def windows_for_variant(
                 region_length=WINDOW_BP,
             )
         except Exception as e:
-            logger.debug(
-                "skipping window %s:%d-%d (%s)", variant.chrom, start, end, e
-            )
+            logger.debug("skipping window %s:%d-%d (%s)", variant.chrom, start, end, e)
             continue
 
         fname = f"{variant.chrom}_{start}_{end}_{label}.png"
@@ -161,6 +161,7 @@ def windows_for_variant(
 def get_chrom_lengths(bam_path: str) -> Dict[str, int]:
     """Return {chrom: length} from the BAM header (uses pysam)."""
     import pysam
+
     with pysam.AlignmentFile(bam_path, "rb") as bam:
         return {sq["SN"]: sq["LN"] for sq in bam.header["SQ"]}
 
@@ -198,6 +199,7 @@ def generate(
         Path to the manifest CSV.
     """
     rng = random.Random(seed)
+    np.random.seed(seed)
 
     out_root = Path(output_dir) / sample
     del_dir = out_root / "deletion"
@@ -214,13 +216,17 @@ def generate(
     all_variants = vcf.load_variants(variant_type="deletion", sample_id=sample)
     chroms_set = set(str(c) for c in chroms)
     variants = [
-        v for v in all_variants
-        if str(v.chrom) in chroms_set
-        and min_length <= v.length <= max_length
+        v
+        for v in all_variants
+        if str(v.chrom) in chroms_set and min_length <= v.length <= max_length
     ]
     logger.info(
         "Kept %d / %d variants (chroms=%s, %d ≤ length ≤ %d)",
-        len(variants), len(all_variants), sorted(chroms_set), min_length, max_length,
+        len(variants),
+        len(all_variants),
+        sorted(chroms_set),
+        min_length,
+        max_length,
     )
 
     # Optional per-chromosome cap.
@@ -236,13 +242,16 @@ def generate(
         variants = capped
         logger.info(
             "Capped to %d deletions (≤ %d per chrom)",
-            len(variants), del_count_per_chrom,
+            len(variants),
+            del_count_per_chrom,
         )
 
     # ── Mixed-strategy setup ─────────────────────────────────────────────────
     chrom_lengths: Dict[str, int] = {}
     if neg_strategy == "mixed":
-        logger.info("Mixed negative strategy enabled — reading chromosome lengths from BAM …")
+        logger.info(
+            "Mixed negative strategy enabled — reading chromosome lengths from BAM …"
+        )
         chrom_lengths = get_chrom_lengths(bam_path)
         # Restrict chrom_lengths to the chroms being processed so random
         # negatives don't land on chromosomes we aren't generating images for.
@@ -254,13 +263,17 @@ def generate(
         # variant produces 2 anchors (up + down), we aim for a proportionally
         # sized random pool distributed across all variants.
         avg_win_len = (
-            int(sum(v.length for v in variants) / len(variants))
-            if variants else 500
+            int(sum(v.length for v in variants) / len(variants)) if variants else 500
         )
         avg_win_len = min(avg_win_len, 700)  # same 80%-cap as anchor logic
         n_random_total = max(
             1,
-            int(len(variants) * 2 * (RANDOM_RATIO / ANCHOR_RATIO) * neg_random_pool_factor),
+            int(
+                len(variants)
+                * 2
+                * (RANDOM_RATIO / ANCHOR_RATIO)
+                * neg_random_pool_factor
+            ),
         )
         logger.info("  pre-sampling %d random genome-wide negatives …", n_random_total)
         random_neg_pool: List[Variant] = vcf.sample_random_negatives(
@@ -276,20 +289,33 @@ def generate(
 
     # ── Main loop ────────────────────────────────────────────────────────────
     rows: List[WindowRecord] = []
+    n_rejected = 0  # candidates dropped by K-means confirmation
 
     with BAMHandler(bam_path) as bam:
         for i, variant in enumerate(variants, 1):
             # Step 2: refine breakpoints via depth + clipping K-means.
+            # Like legacy call_del, candidates whose depth profile does not
+            # show a confirmed deletion signal are dropped entirely.
             if refiner is not None:
                 try:
-                    variant = refiner.refine_boundaries(bam, variant)
+                    refined = refiner.refine_boundaries(bam, variant)
                 except Exception as e:
                     logger.debug("refinement failed for %s: %s", variant, e)
+                    refined = None
+
+                if refined is None:
+                    n_rejected += 1
+                    logger.debug(
+                        "candidate rejected by K-means: %s:%d-%d",
+                        variant.chrom,
+                        variant.start,
+                        variant.end,
+                    )
+                    continue
+                variant = refined
 
             # ── Positive-class images ────────────────────────────────────────
-            rows.extend(
-                windows_for_variant(variant, bam, image_gen, del_dir, label=1)
-            )
+            rows.extend(windows_for_variant(variant, bam, image_gen, del_dir, label=1))
 
             # ── Negative-class images ────────────────────────────────────────
             if neg_strategy == "anchor":
@@ -299,8 +325,12 @@ def generate(
                 for a in anchors:
                     rows.extend(
                         windows_for_variant(
-                            a, bam, image_gen, nondel_dir,
-                            label=0, neg_type="anchor",
+                            a,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            label=0,
+                            neg_type="anchor",
                         )
                     )
 
@@ -311,8 +341,12 @@ def generate(
                 for a in anchors:
                     rows.extend(
                         windows_for_variant(
-                            a, bam, image_gen, nondel_dir,
-                            label=0, neg_type="anchor",
+                            a,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            label=0,
+                            neg_type="anchor",
                         )
                     )
 
@@ -327,8 +361,12 @@ def generate(
                 for r in regional:
                     rows.extend(
                         windows_for_variant(
-                            r, bam, image_gen, nondel_dir,
-                            label=0, neg_type="regional",
+                            r,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            label=0,
+                            neg_type="regional",
                         )
                     )
 
@@ -338,15 +376,21 @@ def generate(
                 if rand_neg is not None:
                     rows.extend(
                         windows_for_variant(
-                            rand_neg, bam, image_gen, nondel_dir,
-                            label=0, neg_type="random",
+                            rand_neg,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            label=0,
+                            neg_type="random",
                         )
                     )
 
             if i % 25 == 0 or i == len(variants):
                 logger.info(
                     "  processed %d/%d variants — %d windows so far",
-                    i, len(variants), len(rows),
+                    i,
+                    len(variants),
+                    len(rows),
                 )
 
     # ── Write manifest ───────────────────────────────────────────────────────
@@ -355,17 +399,33 @@ def generate(
         w = csv.writer(f)
         w.writerow(["image_path", "chrom", "position", "label", "length", "neg_type"])
         for r in rows:
-            w.writerow([r.image_path, r.chrom, r.position, r.label, r.length, r.neg_type])
+            w.writerow(
+                [r.image_path, r.chrom, r.position, r.label, r.length, r.neg_type]
+            )
 
     n_pos = sum(1 for r in rows if r.label == 1)
     n_neg = len(rows) - n_pos
-    n_anchor   = sum(1 for r in rows if r.neg_type == "anchor")
+    n_anchor = sum(1 for r in rows if r.neg_type == "anchor")
     n_regional = sum(1 for r in rows if r.neg_type == "regional")
-    n_random   = sum(1 for r in rows if r.neg_type == "random")
+    n_random = sum(1 for r in rows if r.neg_type == "random")
+
+    if n_rejected:
+        logger.info(
+            "K-means filtering rejected %d / %d candidates (%.1f%%)",
+            n_rejected,
+            len(variants),
+            100 * n_rejected / max(len(variants), 1),
+        )
 
     logger.info(
         "Wrote %d rows to %s  (pos=%d  neg=%d  [anchor=%d  regional=%d  random=%d])",
-        len(rows), manifest_path, n_pos, n_neg, n_anchor, n_regional, n_random,
+        len(rows),
+        manifest_path,
+        n_pos,
+        n_neg,
+        n_anchor,
+        n_regional,
+        n_random,
     )
     return manifest_path
 
@@ -384,21 +444,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bam", required=True, help="Path to indexed BAM file")
     p.add_argument("--vcf", required=True, help="Path to indexed VCF.gz with SVs")
     p.add_argument(
-        "--chroms", required=True,
+        "--chroms",
+        required=True,
         help="Comma-separated chromosome list (e.g. '20,21,22' or 'chr20,chr21')",
     )
     p.add_argument(
-        "--output-dir", default="data/fused",
+        "--output-dir",
+        default="data/fused",
         help="Root directory for images + manifest (default: data/fused)",
     )
     p.add_argument("--max-length", type=int, default=10_000)
     p.add_argument("--min-length", type=int, default=50)
     p.add_argument(
-        "--del-count", type=int, default=None,
+        "--del-count",
+        type=int,
+        default=None,
         help="Optional cap on deletions per chromosome",
     )
     p.add_argument(
-        "--no-refine", action="store_true",
+        "--no-refine",
+        action="store_true",
         help="Skip K-means breakpoint refinement (Step 2)",
     )
     p.add_argument("--seed", type=int, default=42)
@@ -415,11 +480,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--neg-regional-distance-kb", type=int, default=200,
+        "--neg-regional-distance-kb",
+        type=int,
+        default=200,
         help="Distance (kb) from deletion for Level-2 regional negatives (default: 200).",
     )
     p.add_argument(
-        "--neg-random-pool-factor", type=float, default=1.0,
+        "--neg-random-pool-factor",
+        type=float,
+        default=1.0,
         help=(
             "Scaling factor for the genome-wide random pool size "
             "(default: 1.0 = match anchor count)."
