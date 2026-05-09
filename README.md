@@ -51,7 +51,7 @@ Step 4b Inference               per-window probabilities → merged DEL calls �
 
 1. **Load known deletions** from a truth VCF (e.g. 1000 Genomes Phase 3 SV calls).
 2. **Slide a 50 bp window** across each deletion, rendering a 256×256 RGB image from the BAM pileup. Each pixel column = one genomic position; each row = one overlapping read. Pixel colour encodes nucleotide, mapping quality, pair status, CIGAR operations, and soft-clipping.
-3. **Generate matching non-deletion windows** (upstream / downstream anchor regions of the same length) as the negative class.
+3. **Generate matching non-deletion windows** using the **"E3" Mixed Negative Sampling strategy**. This combines *regional* negative sampling (upstream / downstream anchor regions of the same length) with *random* genomic negative sampling as the negative class.
 4. **Train a CNN** to classify each image as `deletion` (label 1) or `non-deletion` (label 0).
 5. **At inference** the window slides across the target genome, classifies each window, and adjacent positive predictions are merged into deletion calls written to VCF.
 
@@ -142,7 +142,7 @@ cadc/
 │   ├── visualization/
 │   │   └── image_generator.py       # Pileup → 256×256 RGB image
 │   ├── models/
-│   │   ├── cnn.py                   # ModernDeletionCNN (M0 backbone)
+│   │   ├── cnn.py                   # ModernDeletionCNN (M0 backbone - strict architectural parity with legacy Keras model)
 │   │   ├── film.py                  # FiLMGenerator + apply_film
 │   │   └── fused_cnn.py             # FusedDeepSV (M1): CNN + FiLM injection
 │   ├── training/
@@ -247,7 +247,9 @@ python scripts/generate_fused_dataset.py \
 1. Loads deletions from VCF, filters by chromosome and length.
 2. Refines each deletion's breakpoints using 3-cluster K-means on coverage depth + soft-clipping signals (61 bp rolling median pre-smoothed).
 3. Slides a 50 bp window across each deletion → 256×256 RGB pileup PNG → manifest row.
-4. Generates upstream and downstream non-deletion anchor windows (same length) as the negative class.
+4. Generates negative windows using the E3 mixed strategy (regional anchors and random genomic coordinates).
+
+*Note: The data handler includes robust fault tolerance for truncated BAM files (`OSError: no BGZF EOF marker`), gracefully skipping corrupted records.*
 
 **Output:** `data/fused/NA12878/manifest.csv` with columns `image_path, chrom, position, label, length`.
 
@@ -392,7 +394,7 @@ import torchvision.transforms as transforms
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
 # ── M0: RGB-only ──────────────────────────────────────────────────────────
