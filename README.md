@@ -80,11 +80,11 @@ Each `FiLMGenerator` is a two-layer MLP `Linear(256→128) → ReLU → Linear(1
 
 | Point | Channels | Modulated |
 |-------|----------|-----------|
-| After block 1 (pool1) | 32 | ✗ too low-level |
-| After block 2 (pool2) | 64 | ✗ too low-level |
-| **After block 3 (pool3)** | **128** | **✓ hook3** |
-| **After block 4 (pool4)** | **256** | **✓ hook4** |
-| After block 5 (refinement) | 256 | ✗ spatial info already aggregated |
+| After block 1 (pool1) | 96 | ✗ too low-level |
+| After block 2 (pool2) | 96 | ✗ too low-level |
+| **After block 3 (pool3)** | **96** | **✓ hook3** |
+| **After block 4 (pool4)** | **96** | **✓ hook4** |
+| After block 5 (refinement) | 96 | ✗ spatial info already aggregated |
 
 ### Two-stage training
 
