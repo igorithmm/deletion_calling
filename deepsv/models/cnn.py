@@ -1,4 +1,5 @@
 """PyTorch CNN model for deletion detection"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,39 +15,63 @@ class ModernDeletionCNN(nn.Module):
     BLOCK3_CHANNELS: int = 96
     BLOCK4_CHANNELS: int = 96
 
-    def __init__(self, num_classes: int = 2, input_channels: int = 3, n_base_filters: int = 96, dropout_rate: float = 0.3):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        input_channels: int = 3,
+        n_base_filters: int = 96,
+        dropout_rate: float = 0.3,
+    ):
         super(ModernDeletionCNN, self).__init__()
 
         # ── Block 1 ──
-        self.conv1_1 = nn.Conv2d(input_channels, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv1_1 = nn.Conv2d(
+            input_channels, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn1_1 = nn.BatchNorm2d(n_base_filters)
-        self.conv1_2 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv1_2 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn1_2 = nn.BatchNorm2d(n_base_filters)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
 
         # ── Block 2 ──
-        self.conv2_1 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv2_1 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn2_1 = nn.BatchNorm2d(n_base_filters)
-        self.conv2_2 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv2_2 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn2_2 = nn.BatchNorm2d(n_base_filters)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
 
         # ── Block 3 ──
-        self.conv3_1 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv3_1 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn3_1 = nn.BatchNorm2d(n_base_filters)
-        self.conv3_2 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv3_2 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn3_2 = nn.BatchNorm2d(n_base_filters)
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
 
         # ── Block 4 ──
-        self.conv4_1 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv4_1 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn4_1 = nn.BatchNorm2d(n_base_filters)
-        self.conv4_2 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv4_2 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn4_2 = nn.BatchNorm2d(n_base_filters)
         self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
 
         # ── Block 5 ──
-        self.conv5 = nn.Conv2d(n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1)
+        self.conv5 = nn.Conv2d(
+            n_base_filters, n_base_filters, kernel_size=3, stride=1, padding=1
+        )
         self.bn5 = nn.BatchNorm2d(n_base_filters)
         self.drop5 = nn.Dropout(dropout_rate)
 
@@ -64,7 +89,9 @@ class ModernDeletionCNN(nn.Module):
         """Initialize model weights"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="leaky_relu"
+                )
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):

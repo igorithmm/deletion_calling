@@ -17,6 +17,7 @@ Stratified evaluation
 ─────────────────────
 reported.
 """
+
 from __future__ import annotations
 
 import logging
@@ -51,24 +52,23 @@ LENGTH_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
 )
 
 
-
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Metrics
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _binary_prf(
-    y_true: np.ndarray, y_pred: np.ndarray
-) -> Tuple[float, float, float]:
+def _binary_prf(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
     """Precision / recall / F1 for the positive class (label 1)."""
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     fp = int(((y_pred == 1) & (y_true == 0)).sum())
     fn = int(((y_pred == 0) & (y_true == 1)).sum())
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return precision, recall, f1
 
 
@@ -92,8 +92,8 @@ class FiLMTrainer:
         device: Optional[torch.device] = None,
     ) -> None:
         """Args:
-            model: The :class:`FusedDeepSV` to train.
-            device: Device for training. Defaults to CUDA if available.
+        model: The :class:`FusedDeepSV` to train.
+        device: Device for training. Defaults to CUDA if available.
         """
         self.model = model
         self.device = device or torch.device(
@@ -133,7 +133,7 @@ class FiLMTrainer:
     # Train / validate loops
     # ------------------------------------------------------------------
 
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader, max_grad_norm: float = 1.0) -> Dict[str, float]:
         """One epoch of training over ``(image, embedding, label)`` triples."""
         self.model.train()
         running_loss = 0.0
@@ -151,25 +151,29 @@ class FiLMTrainer:
             outputs = self.model(images, embeddings)
             loss = self.criterion(outputs, labels_dev)
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
             self.optimizer.step()
 
             running_loss += loss.item()
             probs = torch.softmax(outputs.data, dim=1)[:, 1]
             _, predicted = torch.max(outputs.data, 1)
-            
+
             all_preds.extend(predicted.cpu().tolist())
             all_labels.extend(labels.tolist())
             all_probs.extend(probs.cpu().tolist())
 
-            pbar.set_postfix({
-                "loss": running_loss / max(1, len(all_labels) // labels.size(0)),
-            })
+            pbar.set_postfix(
+                {
+                    "loss": running_loss / max(1, len(all_labels) // labels.size(0)),
+                }
+            )
 
         y_true = np.array(all_labels)
         y_pred = np.array(all_preds)
         precision, recall, f1 = _binary_prf(y_true, y_pred)
         acc = 100.0 * float((y_pred == y_true).mean()) if len(y_true) else 0.0
-        
+
         try:
             auc = roc_auc_score(y_true, all_probs)
         except ValueError:
@@ -209,11 +213,16 @@ class FiLMTrainer:
                 external breakpoint-distance estimate per sample.
         """
         # Guard against silent misalignment when callers shuffle by accident.
-        any_stratified = any(v is not None for v in (sample_lengths, sample_breakpoint_distances))
+        any_stratified = any(
+            v is not None for v in (sample_lengths, sample_breakpoint_distances)
+        )
         if any_stratified:
             from torch.utils.data import RandomSampler  # local import
+
             sampler = getattr(dataloader, "sampler", None)
-            if isinstance(sampler, RandomSampler) or getattr(dataloader, "shuffle", False):
+            if isinstance(sampler, RandomSampler) or getattr(
+                dataloader, "shuffle", False
+            ):
                 logger.warning(
                     "validate(): dataloader appears to be shuffled but "
                     "stratified metrics were requested. Per-bucket numbers "
@@ -245,7 +254,7 @@ class FiLMTrainer:
         y_pred = np.array(all_preds)
         precision, recall, f1 = _binary_prf(y_true, y_pred)
         acc = 100.0 * float((y_pred == y_true).mean()) if len(y_true) else 0.0
-        
+
         try:
             auc = roc_auc_score(y_true, all_probs)
         except ValueError:
@@ -282,7 +291,6 @@ class FiLMTrainer:
                         np.asarray(sample_breakpoint_distances)[mask].mean()
                     )
 
-
         return metrics
 
     # ------------------------------------------------------------------
@@ -300,13 +308,15 @@ class FiLMTrainer:
         weight_decay: float = 1e-6,
         save_path: Optional[Path] = None,
         validate_kwargs: Optional[Dict] = None,
+        max_grad_norm: float = 1.0,
+        lr_patience: int = 3,
     ) -> Dict[str, float]:
         """Run the two-stage training schedule.
 
         Returns the best-epoch validation metrics dict.
         """
         # Compute class weights to handle imbalance
-        if hasattr(train_loader.dataset, 'labels'):
+        if hasattr(train_loader.dataset, "labels"):
             dataset_labels = np.array(train_loader.dataset.labels)
             class_counts = np.bincount(dataset_labels)
             if len(class_counts) == 2:
@@ -314,7 +324,9 @@ class FiLMTrainer:
                 weights = total / (2.0 * class_counts)
                 class_weights = torch.FloatTensor(weights).to(self.device)
                 self.criterion = nn.CrossEntropyLoss(weight=class_weights)
-                logger.info(f"Class imbalance handled. Counts: {class_counts}. Using weights: {weights}")
+                logger.info(
+                    f"Class imbalance handled. Counts: {class_counts}. Using weights: {weights}"
+                )
 
         validate_kwargs = validate_kwargs or {}
         best_f1 = -1.0
@@ -333,11 +345,24 @@ class FiLMTrainer:
         if stage_a_epochs > 0:
             logger.info("=== Stage A: FiLM-only (lr=%g) ===", lr_film)
             self._build_stage_a_optimizer(lr_film=lr_film, weight_decay=weight_decay)
+            scheduler_a = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='max', factor=0.5, patience=max(1, lr_patience // 2)
+            )
             for epoch in range(stage_a_epochs):
                 t0 = time.time()
-                tm = self.train_epoch(train_loader)
-                vm = self.validate(val_loader, **validate_kwargs) if val_loader else None
+                tm = self.train_epoch(train_loader, max_grad_norm=max_grad_norm)
+                vm = (
+                    self.validate(val_loader, **validate_kwargs) if val_loader else None
+                )
                 self._log_epoch(epoch + 1, num_epochs, "A", t0, tm, vm)
+
+                if vm:
+                    old_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+                    scheduler_a.step(vm["f1"])
+                    new_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+                    if old_lrs != new_lrs:
+                        logger.info("Stage A: Learning rates reduced from %s to %s", old_lrs, new_lrs)
+
                 if vm and vm["f1"] > best_f1 and save_path:
                     best_f1 = vm["f1"]
                     best_metrics = vm
@@ -352,11 +377,24 @@ class FiLMTrainer:
             self._build_stage_b_optimizer(
                 lr_cnn=lr_cnn, lr_film=lr_film, weight_decay=weight_decay
             )
+            scheduler_b = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='max', factor=0.5, patience=lr_patience
+            )
             for epoch in range(stage_a_epochs, num_epochs):
                 t0 = time.time()
-                tm = self.train_epoch(train_loader)
-                vm = self.validate(val_loader, **validate_kwargs) if val_loader else None
+                tm = self.train_epoch(train_loader, max_grad_norm=max_grad_norm)
+                vm = (
+                    self.validate(val_loader, **validate_kwargs) if val_loader else None
+                )
                 self._log_epoch(epoch + 1, num_epochs, "B", t0, tm, vm)
+
+                if vm:
+                    old_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+                    scheduler_b.step(vm["f1"])
+                    new_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
+                    if old_lrs != new_lrs:
+                        logger.info("Stage B: Learning rates reduced from %s to %s", old_lrs, new_lrs)
+
                 if vm and vm["f1"] > best_f1 and save_path:
                     best_f1 = vm["f1"]
                     best_metrics = vm
@@ -400,4 +438,3 @@ class FiLMTrainer:
     def _save(self, path: Path) -> None:
         torch.save(self.model.state_dict(), path)
         logger.info("New best F1 — checkpoint saved to %s", path)
-
