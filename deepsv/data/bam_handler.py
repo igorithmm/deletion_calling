@@ -43,7 +43,7 @@ class BAMHandler:
         if not self._bam_file:
             raise RuntimeError("BAM file not opened. Use context manager.")
         
-        coverage = self._bam_file.count_coverage(chrom, start, end)
+        coverage = self._bam_file.count_coverage(chrom, start, end, quality_threshold=0)
         depth = np.array(list(coverage)).sum(axis=0)
         return depth
     
