@@ -4,13 +4,72 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence, Tuple
 import logging
 from tqdm import tqdm
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+LENGTH_BUCKETS: Tuple[Tuple[str, int, int], ...] = (
+    ("50-200", 50, 200),
+    ("200-500", 200, 500),
+    ("500-1k", 500, 1_000),
+    ("1k-5k", 1_000, 5_000),
+    ("5k-10k", 5_000, 10_000),
+)
+
+
+def _binary_prf(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return precision, recall, f1
+
+
+def _best_threshold_tradeoff(
+    y_true: np.ndarray, probs: np.ndarray
+) -> Dict[str, float]:
+    """Find the validation threshold that maximizes positive-class F1."""
+    if y_true.size == 0 or probs.size == 0:
+        return {
+            "best_threshold": 0.5,
+            "best_threshold_precision": 0.0,
+            "best_threshold_recall": 0.0,
+            "best_threshold_f1": 0.0,
+        }
+
+    thresholds = np.unique(np.concatenate(([0.0, 0.5, 1.0], probs)))
+    best = {
+        "best_threshold": 0.5,
+        "best_threshold_precision": 0.0,
+        "best_threshold_recall": 0.0,
+        "best_threshold_f1": -1.0,
+    }
+    for threshold in thresholds:
+        y_pred = (probs >= threshold).astype(np.int64)
+        precision, recall, f1 = _binary_prf(y_true, y_pred)
+        if f1 > best["best_threshold_f1"]:
+            best = {
+                "best_threshold": float(threshold),
+                "best_threshold_precision": precision,
+                "best_threshold_recall": recall,
+                "best_threshold_f1": f1,
+            }
+    return best
+
+
+def _bucket_f1_summary(metrics: Dict[str, float]) -> str:
+    parts = []
+    for name, _, _ in LENGTH_BUCKETS:
+        key = f"f1_len_{name}"
+        if key in metrics:
+            parts.append(f"{name}={metrics[key]:.3f}")
+    return ", ".join(parts)
 
 
 class ImageDataset(Dataset):
@@ -151,7 +210,10 @@ class ModelTrainer:
             'f1': f1, 'auc': auc
         }
     
-    def validate(self, dataloader: DataLoader) -> Dict[str, float]:
+    def validate(
+            self,
+            dataloader: DataLoader,
+            sample_lengths: Optional[Sequence[int]] = None) -> Dict[str, float]:
         """
         Validate model
         
@@ -193,6 +255,10 @@ class ModelTrainer:
                 })
         
         val_loss = running_loss / len(dataloader)
+        y_true = np.array(all_labels)
+        y_pred = np.array(all_preds)
+        probs_np = np.array(all_probs)
+
         acc = accuracy_score(all_labels, all_preds) * 100
         precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', zero_division=0)
         try:
@@ -200,17 +266,32 @@ class ModelTrainer:
         except ValueError:
             auc = 0.5
         
-        return {
+        metrics = {
             'loss': val_loss, 'accuracy': acc, 
             'precision': precision, 'recall': recall, 
             'f1': f1, 'auc': auc
         }
+        metrics.update(_best_threshold_tradeoff(y_true, probs_np))
+
+        if sample_lengths is not None and len(sample_lengths) == len(y_true):
+            lengths = np.asarray(sample_lengths)
+            for name, lo, hi in LENGTH_BUCKETS:
+                mask = (lengths >= lo) & (lengths < hi)
+                if mask.sum() == 0:
+                    continue
+                p, r, bucket_f1 = _binary_prf(y_true[mask], y_pred[mask])
+                metrics[f"f1_len_{name}"] = bucket_f1
+                metrics[f"precision_len_{name}"] = p
+                metrics[f"recall_len_{name}"] = r
+
+        return metrics
     
     def train(self,
              train_loader: DataLoader,
              val_loader: Optional[DataLoader] = None,
              num_epochs: int = 10,
-             save_path: Optional[Path] = None):
+             save_path: Optional[Path] = None,
+             validate_kwargs: Optional[Dict] = None):
         """
         Train the model
         
@@ -233,7 +314,9 @@ class ModelTrainer:
                 self.criterion = nn.CrossEntropyLoss(weight=class_weights)
                 logger.info(f"Class imbalance handled. Counts: {class_counts}. Using weights: {weights}")
         
-        best_val_f1 = 0.0
+        validate_kwargs = validate_kwargs or {}
+        best_val_f1 = -1.0
+        best_val_metrics: Dict[str, float] = {}
         start_time = time.time()
         
         logger.info(f"Starting training for {num_epochs} epochs on {self.device}...")
@@ -247,7 +330,7 @@ class ModelTrainer:
             
             # Validate
             if val_loader:
-                val_metrics = self.validate(val_loader)
+                val_metrics = self.validate(val_loader, **validate_kwargs)
                 epoch_end = time.time()
                 epoch_duration = epoch_end - epoch_start
                 
@@ -258,12 +341,25 @@ class ModelTrainer:
                 logger.info(f"Val Loss: {val_metrics['loss']:.4f}, Val Acc: {val_metrics['accuracy']:.2f}%, "
                             f"P: {val_metrics['precision']:.3f}, R: {val_metrics['recall']:.3f}, "
                             f"F1: {val_metrics['f1']:.3f}, AUC: {val_metrics['auc']:.3f}")
+                if "best_threshold" in val_metrics:
+                    logger.info(
+                        "Val threshold sweep: threshold=%.4f P=%.3f R=%.3f F1=%.3f",
+                        val_metrics["best_threshold"],
+                        val_metrics["best_threshold_precision"],
+                        val_metrics["best_threshold_recall"],
+                        val_metrics["best_threshold_f1"],
+                    )
+                bucket_summary = _bucket_f1_summary(val_metrics)
+                if bucket_summary:
+                    logger.info("Val F1 by deletion length: %s", bucket_summary)
                 
                 # Save best model based on F1 instead of accuracy
-                if val_metrics['f1'] > best_val_f1 and save_path:
+                if val_metrics['f1'] > best_val_f1:
                     best_val_f1 = val_metrics['f1']
-                    torch.save(self.model.state_dict(), save_path)
-                    logger.info(f"!!! New Best Model: {best_val_f1:.3f} F1 Score - Saved to {save_path} !!!")
+                    best_val_metrics = val_metrics
+                    if save_path:
+                        torch.save(self.model.state_dict(), save_path)
+                        logger.info(f"!!! New Best Model: {best_val_f1:.3f} F1 Score - Saved to {save_path} !!!")
             else:
                 epoch_end = time.time()
                 epoch_duration = epoch_end - epoch_start
@@ -286,3 +382,12 @@ class ModelTrainer:
         
         total_duration = time.time() - start_time
         logger.info(f"Training completed in {total_duration/60:.2f} minutes.")
+        if best_val_metrics and "best_threshold" in best_val_metrics:
+            logger.info(
+                "Recommended validation threshold after training: %.4f "
+                "(P=%.3f, R=%.3f, F1=%.3f on best validation epoch)",
+                best_val_metrics["best_threshold"],
+                best_val_metrics["best_threshold_precision"],
+                best_val_metrics["best_threshold_recall"],
+                best_val_metrics["best_threshold_f1"],
+            )

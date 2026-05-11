@@ -72,6 +72,47 @@ def _binary_prf(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, f
     return precision, recall, f1
 
 
+def _best_threshold_tradeoff(
+    y_true: np.ndarray, probs: np.ndarray
+) -> Dict[str, float]:
+    """Find the validation threshold that maximizes positive-class F1."""
+    if y_true.size == 0 or probs.size == 0:
+        return {
+            "best_threshold": 0.5,
+            "best_threshold_precision": 0.0,
+            "best_threshold_recall": 0.0,
+            "best_threshold_f1": 0.0,
+        }
+
+    thresholds = np.unique(np.concatenate(([0.0, 0.5, 1.0], probs)))
+    best = {
+        "best_threshold": 0.5,
+        "best_threshold_precision": 0.0,
+        "best_threshold_recall": 0.0,
+        "best_threshold_f1": -1.0,
+    }
+    for threshold in thresholds:
+        y_pred = (probs >= threshold).astype(np.int64)
+        precision, recall, f1 = _binary_prf(y_true, y_pred)
+        if f1 > best["best_threshold_f1"]:
+            best = {
+                "best_threshold": float(threshold),
+                "best_threshold_precision": precision,
+                "best_threshold_recall": recall,
+                "best_threshold_f1": f1,
+            }
+    return best
+
+
+def _bucket_f1_summary(metrics: Dict[str, float]) -> str:
+    parts = []
+    for name, _, _ in LENGTH_BUCKETS:
+        key = f"f1_len_{name}"
+        if key in metrics:
+            parts.append(f"{name}={metrics[key]:.3f}")
+    return ", ".join(parts)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Trainer
 # ════════════════════════════════════════════════════════════════════════════
@@ -107,26 +148,46 @@ class FiLMTrainer:
     # Stage management
     # ------------------------------------------------------------------
 
-    def _build_stage_a_optimizer(self, lr_film: float, weight_decay: float) -> None:
+    def _build_stage_a_optimizer(
+        self, lr_film: float, film_weight_decay: float
+    ) -> None:
         """Stage A: only FiLM params are trainable."""
         self.model.freeze_backbone()
         self.optimizer = optim.Adam(
-            self.model.film_parameters(),
-            lr=lr_film,
-            weight_decay=weight_decay,
+            [
+                {
+                    "params": list(self.model.film_parameters()),
+                    "lr": lr_film,
+                    "weight_decay": film_weight_decay,
+                    "name": "film",
+                }
+            ],
         )
 
     def _build_stage_b_optimizer(
-        self, lr_cnn: float, lr_film: float, weight_decay: float
+        self,
+        lr_cnn: float,
+        lr_film: float,
+        weight_decay: float,
+        film_weight_decay: float,
     ) -> None:
         """Stage B: joint training with two param groups."""
         self.model.unfreeze_backbone()
         self.optimizer = optim.Adam(
             [
-                {"params": list(self.model.cnn_parameters()), "lr": lr_cnn},
-                {"params": list(self.model.film_parameters()), "lr": lr_film},
+                {
+                    "params": list(self.model.cnn_parameters()),
+                    "lr": lr_cnn,
+                    "weight_decay": weight_decay,
+                    "name": "cnn",
+                },
+                {
+                    "params": list(self.model.film_parameters()),
+                    "lr": lr_film,
+                    "weight_decay": film_weight_decay,
+                    "name": "film",
+                },
             ],
-            weight_decay=weight_decay,
         )
 
     # ------------------------------------------------------------------
@@ -140,6 +201,7 @@ class FiLMTrainer:
         all_preds: List[int] = []
         all_labels: List[int] = []
         all_probs: List[float] = []
+        num_batches = 0
 
         pbar = tqdm(dataloader, desc="Training", leave=False)
         for images, embeddings, labels in pbar:
@@ -156,6 +218,7 @@ class FiLMTrainer:
             self.optimizer.step()
 
             running_loss += loss.item()
+            num_batches += 1
             probs = torch.softmax(outputs.data, dim=1)[:, 1]
             _, predicted = torch.max(outputs.data, 1)
 
@@ -165,7 +228,7 @@ class FiLMTrainer:
 
             pbar.set_postfix(
                 {
-                    "loss": running_loss / max(1, len(all_labels) // labels.size(0)),
+                    "loss": running_loss / max(1, num_batches),
                 }
             )
 
@@ -252,6 +315,7 @@ class FiLMTrainer:
 
         y_true = np.array(all_labels)
         y_pred = np.array(all_preds)
+        probs_np = np.array(all_probs)
         precision, recall, f1 = _binary_prf(y_true, y_pred)
         acc = 100.0 * float((y_pred == y_true).mean()) if len(y_true) else 0.0
 
@@ -268,6 +332,7 @@ class FiLMTrainer:
             "f1": f1,
             "auc": auc,
         }
+        metrics.update(_best_threshold_tradeoff(y_true, probs_np))
 
         if sample_breakpoint_distances is not None:
             bps = np.asarray(sample_breakpoint_distances, dtype=np.float64)
@@ -306,6 +371,7 @@ class FiLMTrainer:
         lr_cnn: float = 1e-4,
         lr_film: float = 1e-3,
         weight_decay: float = 1e-6,
+        film_weight_decay: float = 1e-4,
         save_path: Optional[Path] = None,
         validate_kwargs: Optional[Dict] = None,
         max_grad_norm: float = 1.0,
@@ -336,15 +402,22 @@ class FiLMTrainer:
         logger.info(
             "FiLMTrainer: %d total epochs, stage_a=%d, stage_b=%d on %s",
             num_epochs,
-            stage_a_epochs,
-            num_epochs - stage_a_epochs,
+            min(stage_a_epochs, num_epochs),
+            max(0, num_epochs - stage_a_epochs),
             self.device,
         )
 
         # ---- Stage A ----------------------------------------------------
+        stage_a_epochs = min(stage_a_epochs, num_epochs)
         if stage_a_epochs > 0:
-            logger.info("=== Stage A: FiLM-only (lr=%g) ===", lr_film)
-            self._build_stage_a_optimizer(lr_film=lr_film, weight_decay=weight_decay)
+            logger.info(
+                "=== Stage A: FiLM-only (lr=%g, weight_decay=%g) ===",
+                lr_film,
+                film_weight_decay,
+            )
+            self._build_stage_a_optimizer(
+                lr_film=lr_film, film_weight_decay=film_weight_decay
+            )
             scheduler_a = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='max', factor=0.5, patience=max(1, lr_patience // 2)
             )
@@ -356,26 +429,38 @@ class FiLMTrainer:
                 )
                 self._log_epoch(epoch + 1, num_epochs, "A", t0, tm, vm)
 
-                if vm:
-                    old_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
-                    scheduler_a.step(vm["f1"])
-                    new_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
-                    if old_lrs != new_lrs:
-                        logger.info("Stage A: Learning rates reduced from %s to %s", old_lrs, new_lrs)
+                old_lrs = self._lr_state()
+                scheduler_a.step(vm["f1"] if vm else tm["f1"])
+                new_lrs = self._lr_state()
+                if old_lrs != new_lrs:
+                    logger.info(
+                        "Stage A: Learning rates reduced from %s to %s",
+                        old_lrs,
+                        new_lrs,
+                    )
 
-                if vm and vm["f1"] > best_f1 and save_path:
+                if vm and vm["f1"] > best_f1:
                     best_f1 = vm["f1"]
                     best_metrics = vm
-                    self._save(save_path)
+                    if save_path:
+                        self._save(save_path)
 
         # ---- Stage B ----------------------------------------------------
         stage_b_epochs = num_epochs - stage_a_epochs
         if stage_b_epochs > 0:
             logger.info(
-                "=== Stage B: joint (lr_cnn=%g, lr_film=%g) ===", lr_cnn, lr_film
+                "=== Stage B: joint (lr_cnn=%g, lr_film=%g, "
+                "weight_decay_cnn=%g, weight_decay_film=%g) ===",
+                lr_cnn,
+                lr_film,
+                weight_decay,
+                film_weight_decay,
             )
             self._build_stage_b_optimizer(
-                lr_cnn=lr_cnn, lr_film=lr_film, weight_decay=weight_decay
+                lr_cnn=lr_cnn,
+                lr_film=lr_film,
+                weight_decay=weight_decay,
+                film_weight_decay=film_weight_decay,
             )
             scheduler_b = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='max', factor=0.5, patience=lr_patience
@@ -388,23 +473,36 @@ class FiLMTrainer:
                 )
                 self._log_epoch(epoch + 1, num_epochs, "B", t0, tm, vm)
 
-                if vm:
-                    old_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
-                    scheduler_b.step(vm["f1"])
-                    new_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
-                    if old_lrs != new_lrs:
-                        logger.info("Stage B: Learning rates reduced from %s to %s", old_lrs, new_lrs)
+                old_lrs = self._lr_state()
+                scheduler_b.step(vm["f1"] if vm else tm["f1"])
+                new_lrs = self._lr_state()
+                if old_lrs != new_lrs:
+                    logger.info(
+                        "Stage B: Learning rates reduced from %s to %s",
+                        old_lrs,
+                        new_lrs,
+                    )
 
-                if vm and vm["f1"] > best_f1 and save_path:
+                if vm and vm["f1"] > best_f1:
                     best_f1 = vm["f1"]
                     best_metrics = vm
-                    self._save(save_path)
+                    if save_path:
+                        self._save(save_path)
 
         logger.info(
             "Training done in %.1f min. Best val F1 = %.4f",
             (time.time() - start) / 60.0,
             best_f1,
         )
+        if best_metrics and "best_threshold" in best_metrics:
+            logger.info(
+                "Recommended validation threshold after training: %.4f "
+                "(P=%.3f, R=%.3f, F1=%.3f on best validation epoch)",
+                best_metrics["best_threshold"],
+                best_metrics["best_threshold_precision"],
+                best_metrics["best_threshold_recall"],
+                best_metrics["best_threshold_f1"],
+            )
         return best_metrics
 
     # ------------------------------------------------------------------
@@ -434,6 +532,26 @@ class FiLMTrainer:
                 f"F1 {val_metrics['f1']:.3f} AUC {val_metrics['auc']:.3f}"
             )
         logger.info(msg)
+        if val_metrics is not None and "best_threshold" in val_metrics:
+            logger.info(
+                "Val threshold sweep: threshold=%.4f P=%.3f R=%.3f F1=%.3f",
+                val_metrics["best_threshold"],
+                val_metrics["best_threshold_precision"],
+                val_metrics["best_threshold_recall"],
+                val_metrics["best_threshold_f1"],
+            )
+        if val_metrics is not None:
+            bucket_summary = _bucket_f1_summary(val_metrics)
+            if bucket_summary:
+                logger.info("Val F1 by deletion length: %s", bucket_summary)
+
+    def _lr_state(self) -> Dict[str, float]:
+        if self.optimizer is None:
+            return {}
+        return {
+            pg.get("name", f"group{idx}"): float(pg["lr"])
+            for idx, pg in enumerate(self.optimizer.param_groups)
+        }
 
     def _save(self, path: Path) -> None:
         torch.save(self.model.state_dict(), path)

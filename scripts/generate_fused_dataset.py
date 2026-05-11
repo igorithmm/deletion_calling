@@ -17,9 +17,9 @@ For every 50-bp window it writes:
 
 Negative-sampling strategies (``--neg-strategy``):
   anchor  — paired up/down flanks only (original behaviour).
-  mixed   — E3 strategy: 40 % anchor + 30 % regional + 30 % random.
-            Regional = same chrom, ~200 kb away.
-            Random   = arbitrary genomic position, filtered against known SVs.
+  mixed   — balanced 1:4 strategy. If a deletion renders N positive images,
+            render up to N images from each negative source:
+            down anchor, up anchor, regional, and random.
 
 The manifest is the **source of truth** consumed by:
   * ``train_fused_model.py``  — builds ``FusedDataset`` from these rows
@@ -52,7 +52,7 @@ import logging
 import numpy as np
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -73,13 +73,6 @@ logger = logging.getLogger(__name__)
 
 WINDOW_BP = 50  # window size — must match the embeddings precompute
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mixed-strategy target ratios (E3)
-# ─────────────────────────────────────────────────────────────────────────────
-ANCHOR_RATIO = 0.40
-REGIONAL_RATIO = 0.30
-RANDOM_RATIO = 0.30
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data structures
@@ -95,7 +88,7 @@ class WindowRecord:
     position: int  # 0-based start of the 50-bp window
     label: int  # 1 = deletion, 0 = non-deletion
     length: int  # parent variant length (bp)
-    neg_type: str = ""  # "anchor" | "regional" | "random" | "" (positives)
+    neg_type: str = ""  # "anchor_up" | "anchor_down" | "regional" | "random" | ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +103,7 @@ def windows_for_variant(
     out_dir: Path,
     label: int,
     neg_type: str = "",
+    max_windows: Optional[int] = None,
 ) -> List[WindowRecord]:
     """Render a 50-bp sliding window across [variant.start, variant.end).
 
@@ -120,6 +114,8 @@ def windows_for_variant(
     n_windows = max(1, (variant.end - variant.start) // WINDOW_BP)
 
     for w in range(n_windows):
+        if max_windows is not None and len(records) >= max_windows:
+            break
         start = variant.start + w * WINDOW_BP
         end = start + WINDOW_BP
         try:
@@ -137,7 +133,8 @@ def windows_for_variant(
             logger.debug("skipping window %s:%d-%d (%s)", variant.chrom, start, end, e)
             continue
 
-        fname = f"{variant.chrom}_{start}_{end}_{label}.png"
+        tag = neg_type or "positive"
+        fname = f"{variant.chrom}_{start}_{end}_{label}_{tag}.png"
         out_path = out_dir / fname
         image_gen.save_image(img, str(out_path))
         records.append(
@@ -148,6 +145,34 @@ def windows_for_variant(
                 label=label,
                 length=variant.length,
                 neg_type=neg_type,
+            )
+        )
+    return records
+
+
+def render_target_windows(
+    candidates: Sequence[Variant],
+    target_n: int,
+    bam: BAMHandler,
+    image_gen: ImageGenerator,
+    out_dir: Path,
+    neg_type: str,
+) -> List[WindowRecord]:
+    """Render up to ``target_n`` negative windows from candidate regions."""
+    records: List[WindowRecord] = []
+    for candidate in candidates:
+        remaining = target_n - len(records)
+        if remaining <= 0:
+            break
+        records.extend(
+            windows_for_variant(
+                candidate,
+                bam,
+                image_gen,
+                out_dir,
+                label=0,
+                neg_type=neg_type,
+                max_windows=remaining,
             )
         )
     return records
@@ -189,11 +214,10 @@ def generate(
     """Run Steps 1–3 end-to-end and write a manifest CSV.
 
     Args:
-        neg_strategy: ``"anchor"`` (original) or ``"mixed"`` (E3).
+        neg_strategy: ``"anchor"`` (original) or ``"mixed"`` (1:4).
         neg_regional_distance_kb: Distance in kb for Level-2 regional negatives.
-        neg_random_pool_factor:   Multiplier for number of random negatives
-                                  relative to anchor negatives (default 1.0
-                                  means equal total count per variant).
+        neg_random_pool_factor:   Multiplier for random candidate regions tried
+                                  per deletion in mixed mode.
 
     Returns:
         Path to the manifest CSV.
@@ -258,34 +282,6 @@ def generate(
         chrom_lengths = {c: l for c, l in chrom_lengths.items() if c in chroms_set}
         logger.info("  chromosome lengths available for %d chroms", len(chrom_lengths))
 
-        # Pre-build the random-negative pool for the whole run.
-        # We target RANDOM_RATIO of total negatives.  Since each positive
-        # variant produces 2 anchors (up + down), we aim for a proportionally
-        # sized random pool distributed across all variants.
-        avg_win_len = (
-            int(sum(v.length for v in variants) / len(variants)) if variants else 500
-        )
-        avg_win_len = min(avg_win_len, 700)  # same 80%-cap as anchor logic
-        n_random_total = max(
-            1,
-            int(
-                len(variants)
-                * 2
-                * (RANDOM_RATIO / ANCHOR_RATIO)
-                * neg_random_pool_factor
-            ),
-        )
-        logger.info("  pre-sampling %d random genome-wide negatives …", n_random_total)
-        random_neg_pool: List[Variant] = vcf.sample_random_negatives(
-            all_variants=all_variants,
-            chrom_lengths=chrom_lengths,
-            win_len=avg_win_len,
-            n_windows=n_random_total,
-            rng=rng,
-        )
-        rng.shuffle(random_neg_pool)
-        random_pool_iter = iter(random_neg_pool)
-        logger.info("  random pool ready: %d windows", len(random_neg_pool))
 
     # ── Main loop ────────────────────────────────────────────────────────────
     rows: List[WindowRecord] = []
@@ -315,7 +311,13 @@ def generate(
                 variant = refined
 
             # ── Positive-class images ────────────────────────────────────────
-            rows.extend(windows_for_variant(variant, bam, image_gen, del_dir, label=1))
+            positive_rows = windows_for_variant(
+                variant, bam, image_gen, del_dir, label=1
+            )
+            rows.extend(positive_rows)
+            n_positive_windows = len(positive_rows)
+            if n_positive_windows == 0:
+                continue
 
             # ── Negative-class images ────────────────────────────────────────
             if neg_strategy == "anchor":
@@ -334,56 +336,74 @@ def generate(
                         )
                     )
 
-            else:  # "mixed" — E3 strategy
-                # Level 1: Anchor negatives (40 %)
-                anchors = vcf.get_non_deletion_regions([variant], anchor_type="up")
-                anchors += vcf.get_non_deletion_regions([variant], anchor_type="down")
-                for a in anchors:
-                    rows.extend(
-                        windows_for_variant(
-                            a,
-                            bam,
-                            image_gen,
-                            nondel_dir,
-                            label=0,
-                            neg_type="anchor",
-                        )
-                    )
+            else:  # "mixed" — up to N windows per each negative source.
+                target_bp = n_positive_windows * WINDOW_BP
 
-                # Level 2: Regional negatives (30 %) — same chrom, ~distance_kb away
+                up_anchor = vcf.get_non_deletion_regions(
+                    [variant], anchor_type="up", region_length=target_bp
+                )
+                rows.extend(
+                    render_target_windows(
+                        up_anchor,
+                        n_positive_windows,
+                        bam,
+                        image_gen,
+                        nondel_dir,
+                        neg_type="anchor_up",
+                    )
+                )
+
+                down_anchor = vcf.get_non_deletion_regions(
+                    [variant], anchor_type="down", region_length=target_bp
+                )
+                rows.extend(
+                    render_target_windows(
+                        down_anchor,
+                        n_positive_windows,
+                        bam,
+                        image_gen,
+                        nondel_dir,
+                        neg_type="anchor_down",
+                    )
+                )
+
                 regional = vcf.sample_regional_negatives(
                     variant=variant,
                     all_variants=all_variants,
                     chrom_lengths=chrom_lengths,
                     distance_kb=neg_regional_distance_kb,
+                    win_len=target_bp,
                     rng=rng,
                 )
-                for r in regional:
-                    rows.extend(
-                        windows_for_variant(
-                            r,
-                            bam,
-                            image_gen,
-                            nondel_dir,
-                            label=0,
-                            neg_type="regional",
-                        )
+                rows.extend(
+                    render_target_windows(
+                        regional,
+                        n_positive_windows,
+                        bam,
+                        image_gen,
+                        nondel_dir,
+                        neg_type="regional",
                     )
+                )
 
-                # Level 3: Random genome-wide negatives (30 %)
-                # Draw one window from the pre-sampled pool per variant.
-                rand_neg = next(random_pool_iter, None)
-                if rand_neg is not None:
-                    rows.extend(
-                        windows_for_variant(
-                            rand_neg,
-                            bam,
-                            image_gen,
-                            nondel_dir,
-                            label=0,
-                            neg_type="random",
-                        )
+                random_candidate_count = max(1, int(4 * neg_random_pool_factor))
+                random_candidates = vcf.sample_random_negatives(
+                    all_variants=all_variants,
+                    chrom_lengths=chrom_lengths,
+                    win_len=target_bp,
+                    n_windows=random_candidate_count,
+                    rng=rng,
+                )
+                rows.extend(
+                    render_target_windows(
+                        random_candidates,
+                        n_positive_windows,
+                        bam,
+                        image_gen,
+                        nondel_dir,
+                        neg_type="random",
                     )
+                )
 
             if i % 25 == 0 or i == len(variants):
                 logger.info(
@@ -405,7 +425,9 @@ def generate(
 
     n_pos = sum(1 for r in rows if r.label == 1)
     n_neg = len(rows) - n_pos
-    n_anchor = sum(1 for r in rows if r.neg_type == "anchor")
+    n_anchor = sum(1 for r in rows if r.neg_type in ("anchor", "anchor_up", "anchor_down"))
+    n_anchor_up = sum(1 for r in rows if r.neg_type == "anchor_up")
+    n_anchor_down = sum(1 for r in rows if r.neg_type == "anchor_down")
     n_regional = sum(1 for r in rows if r.neg_type == "regional")
     n_random = sum(1 for r in rows if r.neg_type == "random")
 
@@ -418,12 +440,15 @@ def generate(
         )
 
     logger.info(
-        "Wrote %d rows to %s  (pos=%d  neg=%d  [anchor=%d  regional=%d  random=%d])",
+        "Wrote %d rows to %s  (pos=%d  neg=%d  "
+        "[anchor=%d up=%d down=%d  regional=%d  random=%d])",
         len(rows),
         manifest_path,
         n_pos,
         n_neg,
         n_anchor,
+        n_anchor_up,
+        n_anchor_down,
         n_regional,
         n_random,
     )
@@ -476,7 +501,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Negative-sampling strategy.\n"
             "  anchor — original: only paired flanks of each deletion.\n"
-            "  mixed  — E3: 40%% anchor + 30%% regional + 30%% random."
+            "  mixed  — render N positives and up to N negatives from each "
+            "of: up anchor, down anchor, regional, random."
         ),
     )
     p.add_argument(
@@ -490,8 +516,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Scaling factor for the genome-wide random pool size "
-            "(default: 1.0 = match anchor count)."
+            "Scaling factor for random candidate regions tried per deletion "
+            "in mixed mode (default: 1.0)."
         ),
     )
     return p.parse_args()

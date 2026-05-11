@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Variant:
-    """Represents a structural variant"""
+    """Represents a structural variant in 0-based half-open coordinates."""
     chrom: str
     start: int
     end: int
@@ -96,15 +96,13 @@ class VCFHandler:
                     continue
             
             chrom = record.chrom
-            start = record.pos
-            
-            end = None
-            if 'END' in record.info:
-                end = record.info['END']
-                if isinstance(end, tuple) or isinstance(end, list):
-                    end = end[0]
-            else:
-                 end = record.stop
+
+            # pysam exposes VCF POS both as record.pos (1-based) and
+            # record.start (0-based). All downstream BAM/pileup calls use
+            # pysam's 0-based half-open convention, so keep Variant in that
+            # coordinate system.
+            start = record.start
+            end = record.stop
             
             variant = Variant(chrom=chrom, start=start, end=end, sv_type=final_type)
             variants.append(variant)
@@ -113,14 +111,20 @@ class VCFHandler:
         
         return variants
     
-    def get_non_deletion_regions(self, variants: List[Variant],
-                                 anchor_type: str = "up") -> List[Variant]:
+    def get_non_deletion_regions(
+        self,
+        variants: List[Variant],
+        anchor_type: str = "up",
+        region_length: Optional[int] = None,
+    ) -> List[Variant]:
         """
         Generate non-deletion anchor regions for training (Level 1 – hard negatives).
 
         Args:
             variants: List of deletion variants
             anchor_type: 'up' or 'down' anchor
+            region_length: Optional explicit anchor length. If omitted, uses
+                the legacy deletion-length rule.
 
         Returns:
             List of non-deletion regions
@@ -128,9 +132,12 @@ class VCFHandler:
         anchor_regions = []
 
         for variant in variants:
-            del_length = variant.length
-            if del_length > 700:
-                del_length = 4 * del_length // 5  # Cap at 80% of original
+            if region_length is None:
+                del_length = variant.length
+                if del_length > 700:
+                    del_length = 4 * del_length // 5  # Cap at 80% of original
+            else:
+                del_length = int(region_length)
 
             if anchor_type == "up":
                 start = max(0, variant.start - del_length - 150)
@@ -176,6 +183,7 @@ class VCFHandler:
         all_variants: List[Variant],
         chrom_lengths: Dict[str, int],
         distance_kb: int = 200,
+        win_len: Optional[int] = None,
         max_tries: int = 10,
         rng: Optional[random.Random] = None,
     ) -> List[Variant]:
@@ -191,6 +199,8 @@ class VCFHandler:
             all_variants:   Full list of known variants (for overlap filtering).
             chrom_lengths:  Dict mapping chrom name → length in bp.
             distance_kb:    Minimum distance from the deletion in kilobases.
+            win_len:        Optional explicit negative-region length. If
+                            omitted, uses the legacy deletion-length rule.
             max_tries:      How many jittered offsets to attempt per side.
             rng:            Optional seeded random.Random for reproducibility.
 
@@ -201,9 +211,12 @@ class VCFHandler:
             rng = random.Random()
 
         sv_index = self._build_sv_index(all_variants)
-        win_len = variant.length
-        if win_len > 700:
-            win_len = 4 * win_len // 5
+        if win_len is None:
+            win_len = variant.length
+            if win_len > 700:
+                win_len = 4 * win_len // 5
+        else:
+            win_len = int(win_len)
 
         offset_bp = distance_kb * 1_000
         chrom_len = chrom_lengths.get(variant.chrom, 0)

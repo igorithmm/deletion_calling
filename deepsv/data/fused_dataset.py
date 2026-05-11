@@ -16,6 +16,7 @@ init. The chr20–22 cache (~1.5 GB at 256 dim × 50 bp × ~150 Mb / chrom) fits
 in T4 GPU host RAM and avoids per-batch HDF5 reads. Embeddings are cast
 from ``float16`` → ``float32`` before being returned.
 """
+
 from __future__ import annotations
 
 import logging

@@ -107,26 +107,19 @@ def predict_m1(
         )
 
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Merge adjacent positive windows into VCF calls
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def merge_to_calls(
-    rows: List[dict], preds: List[Tuple[float, int]]
-) -> List[dict]:
+def merge_to_calls(rows: List[dict], preds: List[Tuple[float, int]]) -> List[dict]:
     """Merge adjacent positive windows on the same chromosome into calls.
 
     Windows are considered adjacent if they share a chromosome and start
     positions differ by exactly ``WINDOW_BP``. A call is emitted with the
     span from the first window's start to the last window's end + WINDOW_BP.
     """
-    paired = [
-        {**r, "prob": p, "pred": c}
-        for r, (p, c) in zip(rows, preds)
-    ]
+    paired = [{**r, "prob": p, "pred": c} for r, (p, c) in zip(rows, preds)]
     paired.sort(key=lambda r: (r["chrom"], r["position"]))
 
     calls: List[dict] = []
@@ -170,8 +163,12 @@ def write_vcf(calls: List[dict], path: str, sample: str = "SAMPLE") -> None:
         f.write('##INFO=<ID=SVTYPE,Number=1,Type=String,Description="SV type">\n')
         f.write('##INFO=<ID=END,Number=1,Type=Integer,Description="End position">\n')
         f.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="SV length">\n')
-        f.write('##INFO=<ID=NWIN,Number=1,Type=Integer,Description="Number of merged windows">\n')
-        f.write('##INFO=<ID=MAXPROB,Number=1,Type=Float,Description="Max P(DEL) among merged windows">\n')
+        f.write(
+            '##INFO=<ID=NWIN,Number=1,Type=Integer,Description="Number of merged windows">\n'
+        )
+        f.write(
+            '##INFO=<ID=MAXPROB,Number=1,Type=Float,Description="Max P(DEL) among merged windows">\n'
+        )
         f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
         for i, c in enumerate(calls, 1):
             length = c["end"] - c["start"]
@@ -198,8 +195,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest", required=True)
     p.add_argument("--checkpoint", required=True, help="Trained model state_dict")
     p.add_argument("--model", choices=["cnn", "fused"], default="fused")
-    p.add_argument("--embeddings", default=None, help="HDF5 file (required for --model fused)")
-    p.add_argument("--predictions-out", required=True, help="Output CSV with per-window predictions")
+    p.add_argument(
+        "--embeddings", default=None, help="HDF5 file (required for --model fused)"
+    )
+    p.add_argument(
+        "--predictions-out",
+        required=True,
+        help="Output CSV with per-window predictions",
+    )
     p.add_argument("--vcf-out", default=None, help="Optional VCF with merged DEL calls")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--batch-size", type=int, default=64)
@@ -220,23 +223,41 @@ def main() -> None:
         preds = predict_m0(rows, args.checkpoint, args.threshold, args.batch_size)
     else:  # fused
         preds = predict_m1(
-            rows, args.checkpoint, args.embeddings,
-            args.threshold, args.batch_size, args.embed_dim,
+            rows,
+            args.checkpoint,
+            args.embeddings,
+            args.threshold,
+            args.batch_size,
+            args.embed_dim,
         )
 
     # Per-window predictions CSV.
     Path(args.predictions_out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.predictions_out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow([
-            "image_path", "chrom", "position", "label", "length",
-            "prob_deletion", "predicted_class",
-        ])
+        w.writerow(
+            [
+                "image_path",
+                "chrom",
+                "position",
+                "label",
+                "length",
+                "prob_deletion",
+                "predicted_class",
+            ]
+        )
         for r, (prob, cls) in zip(rows, preds):
-            w.writerow([
-                r["image_path"], r["chrom"], r["position"], r["label"],
-                r["length"], f"{prob:.6f}", cls,
-            ])
+            w.writerow(
+                [
+                    r["image_path"],
+                    r["chrom"],
+                    r["position"],
+                    r["label"],
+                    r["length"],
+                    f"{prob:.6f}",
+                    cls,
+                ]
+            )
     logger.info("Wrote per-window predictions to %s", args.predictions_out)
 
     # Optional VCF output.

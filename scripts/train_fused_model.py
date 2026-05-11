@@ -137,13 +137,19 @@ def build_loaders(
         transform=IMAGE_TRANSFORM,
     )
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     # Validation loader MUST be unshuffled so stratified metrics align.
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     return train_loader, val_loader, train_ds, val_ds
 
@@ -153,9 +159,7 @@ def build_loaders(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def train_m0(
-    train_rows, val_rows, args
-) -> None:
+def train_m0(train_rows, val_rows, args) -> None:
     """Image-only baseline: uses :class:`ImageDataset` (no embeddings needed)."""
     tr = manifest_to_lists(train_rows)
     va = manifest_to_lists(val_rows)
@@ -172,12 +176,18 @@ def train_m0(
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
     model = ModernDeletionCNN(num_classes=2)
@@ -188,6 +198,7 @@ def train_m0(
         val_loader=val_loader,
         num_epochs=args.epochs,
         save_path=Path(args.output),
+        validate_kwargs={"sample_lengths": va["lengths"]},
     )
 
 
@@ -202,7 +213,11 @@ def train_m1(train_rows, val_rows, args) -> None:
         "sample_lengths": val_va["lengths"],
     }
 
-    model = FusedDeepSV(embed_dim=args.embed_dim, num_classes=2)
+    model = FusedDeepSV(
+        embed_dim=args.embed_dim,
+        num_classes=2,
+        film_dropout_rate=args.film_dropout,
+    )
     trainer = FiLMTrainer(model)
     trainer.train(
         train_loader=train_loader,
@@ -212,11 +227,10 @@ def train_m1(train_rows, val_rows, args) -> None:
         lr_cnn=args.lr_cnn,
         lr_film=args.lr_film,
         weight_decay=args.weight_decay,
+        film_weight_decay=args.film_weight_decay,
         save_path=Path(args.output),
         validate_kwargs=validate_kwargs,
     )
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,22 +243,29 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--manifest", required=True, help="CSV from generate_fused_dataset.py")
     p.add_argument(
-        "--embeddings", default=None,
+        "--manifest", required=True, help="CSV from generate_fused_dataset.py"
+    )
+    p.add_argument(
+        "--embeddings",
+        default=None,
         help="HyenaDNA embeddings HDF5 (required only for --model fused)",
     )
     p.add_argument(
-        "--model", choices=["cnn", "fused"], default="fused",
+        "--model",
+        choices=["cnn", "fused"],
+        default="fused",
         help="cnn=M0 (image only), fused=M1 (image + HyenaDNA FiLM, default)",
     )
     p.add_argument("--output", required=True, help="Path to save the best checkpoint")
     p.add_argument(
-        "--train-chroms", required=True,
+        "--train-chroms",
+        required=True,
         help="Comma-separated chromosomes for training (e.g. '1,2,3,...,11')",
     )
     p.add_argument(
-        "--val-chroms", required=True,
+        "--val-chroms",
+        required=True,
         help="Comma-separated chromosomes for validation (e.g. '12,...,22')",
     )
     p.add_argument("--epochs", type=int, default=10)
@@ -255,6 +276,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-cnn", type=float, default=1e-4)
     p.add_argument("--lr-film", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-6)
+    p.add_argument(
+        "--film-weight-decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for FiLM generators (default: 1e-4)",
+    )
+    p.add_argument(
+        "--film-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability inside FiLM generators (default: 0.1)",
+    )
     return p.parse_args()
 
 
@@ -268,7 +301,10 @@ def main() -> None:
     train_rows, val_rows = split_rows(rows, train_chroms, val_chroms)
     logger.info(
         "Split: train=%d (%s) val=%d (%s)",
-        len(train_rows), train_chroms, len(val_rows), val_chroms,
+        len(train_rows),
+        train_chroms,
+        len(val_rows),
+        val_chroms,
     )
     if not train_rows or not val_rows:
         raise SystemExit(

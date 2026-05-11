@@ -12,6 +12,7 @@ zero-initialised, so γ = β = 0 and the modulation reduces to the identity
 ``F_out = F * (1 + 0) + 0 = F``. Any deviation from baseline is therefore
 purely learned.
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -25,8 +26,8 @@ from .film import FiLMGenerator, apply_film
 
 # Channel counts at the FiLM injection points.  These must match the
 # conv output channel definitions in cnn.py.
-_HOOK_A_CHANNELS = ModernDeletionCNN.BLOCK3_CHANNELS   # 128
-_HOOK_B_CHANNELS = ModernDeletionCNN.BLOCK4_CHANNELS   # 256
+_HOOK_A_CHANNELS = ModernDeletionCNN.BLOCK3_CHANNELS  # 128
+_HOOK_B_CHANNELS = ModernDeletionCNN.BLOCK4_CHANNELS  # 256
 
 
 class FusedDeepSV(nn.Module):
@@ -45,18 +46,20 @@ class FusedDeepSV(nn.Module):
         num_classes: int = 2,
         input_channels: int = 3,
         film_hidden_dim: int = 128,
+        film_dropout_rate: float = 0.1,
         backbone: Optional[ModernDeletionCNN] = None,
     ) -> None:
         """Args:
-            embed_dim: Sequence embedding dimensionality (default 256 for
-                HyenaDNA-small-32k).
-            num_classes: Number of classifier outputs.
-            input_channels: Number of image channels (3 for RGB pileups).
-            film_hidden_dim: Hidden width of each FiLM generator MLP.
-            backbone: Optionally inject a pre-existing
-                :class:`ModernDeletionCNN` instance (e.g. for
-                transfer-learning from a saved M0 checkpoint).
-                If ``None``, a new :class:`ModernDeletionCNN` is constructed.
+        embed_dim: Sequence embedding dimensionality (default 256 for
+            HyenaDNA-small-32k).
+        num_classes: Number of classifier outputs.
+        input_channels: Number of image channels (3 for RGB pileups).
+        film_hidden_dim: Hidden width of each FiLM generator MLP.
+        film_dropout_rate: Dropout probability inside each FiLM generator.
+        backbone: Optionally inject a pre-existing
+            :class:`ModernDeletionCNN` instance (e.g. for
+            transfer-learning from a saved M0 checkpoint).
+            If ``None``, a new :class:`ModernDeletionCNN` is constructed.
         """
         super().__init__()
 
@@ -66,7 +69,8 @@ class FusedDeepSV(nn.Module):
             self.cnn = backbone
         else:
             self.cnn = ModernDeletionCNN(
-                num_classes=num_classes, input_channels=input_channels,
+                num_classes=num_classes,
+                input_channels=input_channels,
             )
 
         # FiLM channel counts and hook kwarg names for ModernDeletionCNN.
@@ -77,11 +81,13 @@ class FusedDeepSV(nn.Module):
             embed_dim=embed_dim,
             num_channels=_HOOK_A_CHANNELS,
             hidden_dim=film_hidden_dim,
+            dropout_rate=film_dropout_rate,
         )
         self.film_b = FiLMGenerator(
             embed_dim=embed_dim,
             num_channels=_HOOK_B_CHANNELS,
             hidden_dim=film_hidden_dim,
+            dropout_rate=film_dropout_rate,
         )
 
     # ------------------------------------------------------------------

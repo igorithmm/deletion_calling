@@ -14,6 +14,7 @@ DeepSV behaviour and only deviates as the FiLM heads learn.
 Reference: Perez et al., "FiLM: Visual Reasoning with a General Conditioning
 Layer", AAAI 2018.
 """
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -42,21 +43,25 @@ class FiLMGenerator(nn.Module):
         embed_dim: int,
         num_channels: int,
         hidden_dim: int = 128,
+        dropout_rate: float = 0.1,
     ) -> None:
         """Args:
-            embed_dim: Dimensionality of the conditioning vector (e.g. 256
-                for HyenaDNA-small-32k embeddings).
-            num_channels: Number of feature-map channels to modulate (``C_k``).
-            hidden_dim: Width of the MLP hidden layer (default 128).
+        embed_dim: Dimensionality of the conditioning vector (e.g. 256
+            for HyenaDNA-small-32k embeddings).
+        num_channels: Number of feature-map channels to modulate (``C_k``).
+        hidden_dim: Width of the MLP hidden layer (default 128).
+        dropout_rate: Dropout probability after the hidden activation.
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.num_channels = num_channels
         self.hidden_dim = hidden_dim
+        self.dropout_rate = dropout_rate
 
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 2 * num_channels)
         self.activation = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout_rate)
 
         self._initialize_weights()
 
@@ -76,7 +81,7 @@ class FiLMGenerator(nn.Module):
         Returns:
             A tuple ``(γ, β)``, each of shape ``(B, num_channels)``.
         """
-        h = self.activation(self.fc1(z))
+        h = self.dropout(self.activation(self.fc1(z)))
         out = self.fc2(h)  # (B, 2 * C)
         gamma, beta = out.chunk(2, dim=-1)  # each (B, C)
         return gamma, beta
@@ -106,7 +111,11 @@ def apply_film(
         raise ValueError(
             f"gamma and beta must share shape; got {tuple(gamma.shape)} vs {tuple(beta.shape)}"
         )
-    if gamma.dim() != 2 or gamma.shape[0] != feature_map.shape[0] or gamma.shape[1] != feature_map.shape[1]:
+    if (
+        gamma.dim() != 2
+        or gamma.shape[0] != feature_map.shape[0]
+        or gamma.shape[1] != feature_map.shape[1]
+    ):
         raise ValueError(
             f"gamma/beta must be (B, C)=({feature_map.shape[0]}, {feature_map.shape[1]}); "
             f"got {tuple(gamma.shape)}"
