@@ -199,6 +199,7 @@ def train_m0(train_rows, val_rows, args) -> None:
         num_epochs=args.epochs,
         save_path=Path(args.output),
         validate_kwargs={"sample_lengths": va["lengths"]},
+        max_grad_norm=args.max_grad_norm,
     )
 
 
@@ -230,6 +231,7 @@ def train_m1(train_rows, val_rows, args) -> None:
         film_weight_decay=args.film_weight_decay,
         save_path=Path(args.output),
         validate_kwargs=validate_kwargs,
+        max_grad_norm=args.max_grad_norm,
     )
 
 
@@ -287,6 +289,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="Dropout probability inside FiLM generators (default: 0.1)",
+    )
+    p.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping (default: 1.0, 0 to disable)",
     )
     return p.parse_args()
 

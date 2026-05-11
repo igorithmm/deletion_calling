@@ -37,7 +37,7 @@ Step 2  Breakpoint refinement   3-cluster K-means → exact deletion boundaries
 Step 3  Image generation        50 bp sliding window → 256×256 RGB pileup PNG
     │
     ▼  (M1 only)
-HyenaDNA embedding precompute   32 k bp context window → 256-dim vector per 50 bp tile
+HyenaDNA embedding precompute   32 k bp (Small) or 16 k bp (Tiny) context window → 256/128-dim vector per 50 bp tile
     │
     ▼
 Step 4a Training                M0: ModelTrainer (accuracy)
@@ -59,11 +59,11 @@ Step 4b Inference               per-window probabilities → merged DEL calls �
 
 ## FiLM + HyenaDNA (M1 mode)
 
-M1 adds a **second modality**: frozen sequence embeddings from **HyenaDNA-small-32k** fused with CNN features through **FiLM conditioning** (Feature-wise Linear Modulation, Perez et al. 2018).
+M1 adds a **second modality**: frozen sequence embeddings from **HyenaDNA** fused with CNN features through **FiLM conditioning** (Feature-wise Linear Modulation, Perez et al. 2018). Both **HyenaDNA-small-32k** (256-dim) and **HyenaDNA-tiny-16k** (128-dim) models are supported.
 
 ### Why it helps
 
-The baseline CNN (M0) sees only the pileup image. The same genomic position carries its own *sequence context* (motifs, repeats, GC content) that partly explains how likely a deletion signal is. The HyenaDNA embedding provides a compressed 256-dimensional description of this context, and FiLM lets it **modulate CNN feature maps on the fly** without changing the underlying architecture.
+The baseline CNN (M0) sees only the pileup image. The same genomic position carries its own *sequence context* (motifs, repeats, GC content) that partly explains how likely a deletion signal is. The HyenaDNA embedding provides a compressed 128 or 256-dimensional description of this context, and FiLM lets it **modulate CNN feature maps on the fly** without changing the underlying architecture.
 
 ### FiLM equation
 
@@ -74,7 +74,7 @@ For a feature map `F` of shape `(B, C, H, W)`:
 F_out = F × (1 + γ.view(B,C,1,1)) + β.view(B,C,1,1)
 ```
 
-Each `FiLMGenerator` is a two-layer MLP `Linear(256→128) → ReLU → Linear(128→2·C)`. **The final Linear is zero-initialised** (weights and biases), so at step 0 γ = β = 0 and FiLM is an **exact identity**: `F_out = F`. Training starts from baseline M0 behaviour and deviates only as the FiLM heads learn.
+Each `FiLMGenerator` is a two-layer MLP `Linear(D→128) → ReLU → Linear(128→2·C)` (where D is 128 or 256). **The final Linear is zero-initialised** (weights and biases), so at step 0 γ = β = 0 and FiLM is an **exact identity**: `F_out = F`. Training starts from baseline M0 behaviour and deviates only as the FiLM heads learn.
 
 ### Injection points (ModernDeletionCNN)
 
@@ -93,7 +93,14 @@ Implemented in `deepsv/training/film_trainer.py`:
 - **Stage A** (default 2 epochs): backbone frozen, FiLM generators only. Single param group at `lr_film = 1e-3`.
 - **Stage B** (remaining epochs): backbone unfrozen, two param groups — CNN @ `lr_cnn = 1e-4`, FiLM @ `lr_film = 1e-3`.
 
-Best checkpoint is selected by **validation F1** (positive class), not accuracy. Loss = `nn.CrossEntropyLoss` on the 2-logit softmax head.
+Best checkpoint is selected by **validation F1** (positive class), not accuracy. Loss = `nn.CrossEntropyLoss` on the 2-logit softmax head, with **automatic class-weighting** to handle dataset imbalance.
+
+### Training Optimizations
+
+CADC includes several mechanisms for improved stability and performance:
+- **Gradient Clipping**: `torch.nn.utils.clip_grad_norm_` (max_norm=1.0) is used to prevent exploding gradients.
+- **Learning Rate Scheduler**: `ReduceLROnPlateau` automatically halves the learning rate if the validation F1 stagnates.
+- **Weighted Loss**: `CrossEntropyLoss` is automatically weighted based on training set class frequencies.
 
 ### Embedding precompute
 
@@ -111,11 +118,11 @@ python scripts/precompute_hyenadna_embeddings.py \
 HDF5 layout:
 
 ```
-/chr1   shape=(n_windows, 256)  dtype=float16   # n_windows = ceil(chrom_len / 50)
+/chr1   shape=(n_windows, D)     dtype=float16   # D=128 or 256
 /chr2   ...
 attrs:
   window_bp  = 50
-  embed_dim  = 256
+  embed_dim  = 128 or 256
   model_id   = LongSafari/hyenadna-small-32k-seqlen-hf
   ...
 ```
@@ -158,7 +165,8 @@ cadc/
 │
 ├── scripts/
 │   ├── generate_fused_dataset.py    # Steps 1–3: BAM+VCF → images + manifest CSV
-│   ├── precompute_hyenadna_embeddings.py  # HyenaDNA → HDF5 embedding store
+│   ├── precompute_hyenadna_embeddings.py  # HyenaDNA-Small (32k) precompute
+│   ├── precompute_hyenadna_tiny_16k_embeddings.py # HyenaDNA-Tiny (16k) precompute
 │   ├── train_fused_model.py         # Step 4a: train M0 or M1
 │   ├── call_fused_deletions.py      # Step 4b: inference → predictions CSV + VCF
 │   ├── run_fused_pipeline.sh        # End-to-end driver (all 4 stages)
@@ -225,7 +233,19 @@ python scripts/precompute_hyenadna_embeddings.py \
     --resume          # skip chromosomes already present in the HDF5
 ```
 
-Run once per reference genome. Output is reusable across samples. Uses 30 kbp core chunks with 1 kbp flanks (32 kbp total input) to fit HyenaDNA's 32 k context window.
+Run once per reference genome. Output is reusable across samples.
+- **Small (M1)**: Uses 30 kbp core chunks + 1 kbp flanks (32 kbp input) → 256-dim embeddings.
+- **Tiny (M1)**: Uses 14 kbp core chunks + 1 kbp flanks (16 kbp input) → 128-dim embeddings.
+
+Example for Tiny-16k:
+```bash
+python scripts/precompute_hyenadna_tiny_16k_embeddings.py \
+    --fasta  raw/hs37d5.fa \
+    --output data/hyenadna_tiny_embeddings.h5 \
+    --device cuda \
+    --chrom  20 21 22 \
+    --genome-build hs37d5
+```
 
 ---
 

@@ -3,7 +3,7 @@
 :class:`FusedDeepSV` — the main contribution. Wraps a
 :class:`~deepsv.models.cnn.ModernDeletionCNN` backbone and injects FiLM
 modulation (γ/β predicted from a HyenaDNA embedding) at two mid-level
-feature extraction points: after block 3 (128 ch) and block 4 (256 ch),
+feature extraction points: after block 3 (96 ch) and block 4 (96 ch),
 using ``hook3``/``hook4`` kwargs.
 
 The fused model is initialised so that at step 0 it is a *bit-identical
@@ -26,8 +26,8 @@ from .film import FiLMGenerator, apply_film
 
 # Channel counts at the FiLM injection points.  These must match the
 # conv output channel definitions in cnn.py.
-_HOOK_A_CHANNELS = ModernDeletionCNN.BLOCK3_CHANNELS  # 128
-_HOOK_B_CHANNELS = ModernDeletionCNN.BLOCK4_CHANNELS  # 256
+_HOOK_A_CHANNELS = ModernDeletionCNN.BLOCK3_CHANNELS  # 96
+_HOOK_B_CHANNELS = ModernDeletionCNN.BLOCK4_CHANNELS  # 96
 
 
 class FusedDeepSV(nn.Module):

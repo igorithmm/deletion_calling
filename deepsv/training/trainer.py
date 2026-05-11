@@ -149,12 +149,13 @@ class ModelTrainer:
                 gamma=0.1
             )
     
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader, max_grad_norm: float = 1.0) -> Dict[str, float]:
         """
         Train for one epoch
         
         Args:
             dataloader: DataLoader for training data
+            max_grad_norm: Maximum norm for gradient clipping
             
         Returns:
             Dictionary with training metrics
@@ -179,6 +180,8 @@ class ModelTrainer:
             
             # Backward pass
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
             self.optimizer.step()
             
             # Statistics
@@ -291,7 +294,8 @@ class ModelTrainer:
              val_loader: Optional[DataLoader] = None,
              num_epochs: int = 10,
              save_path: Optional[Path] = None,
-             validate_kwargs: Optional[Dict] = None):
+             validate_kwargs: Optional[Dict] = None,
+             max_grad_norm: float = 1.0):
         """
         Train the model
         
@@ -300,6 +304,7 @@ class ModelTrainer:
             val_loader: Optional DataLoader for validation
             num_epochs: Number of training epochs
             save_path: Path to save best model
+            max_grad_norm: Maximum norm for gradient clipping
         """
         import time
         
@@ -326,7 +331,7 @@ class ModelTrainer:
             logger.info(f"--- Epoch {epoch+1}/{num_epochs} Started ---")
             
             # Train
-            train_metrics = self.train_epoch(train_loader)
+            train_metrics = self.train_epoch(train_loader, max_grad_norm=max_grad_norm)
             
             # Validate
             if val_loader:
