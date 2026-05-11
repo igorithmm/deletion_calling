@@ -14,6 +14,7 @@ class ModernDeletionCNN(nn.Module):
 
     BLOCK3_CHANNELS: int = 96
     BLOCK4_CHANNELS: int = 96
+    CLASSIFIER_X_BINS: int = 16
 
     def __init__(
         self,
@@ -77,8 +78,10 @@ class ModernDeletionCNN(nn.Module):
 
         # ── Classifier ──
         self.flatten = nn.Flatten()
-        # For 255x255 or 256x256 input, 4 pools of 2x2 reduce spatial dimension to 16x16
-        self.fc1 = nn.Linear(n_base_filters * 16 * 16, 256)
+        # Preserve the genomic x-axis while summarising the pileup y-axis.
+        # For 255x255 or 256x256 input, 4 pools of 2x2 reduce x to 16 bins.
+        # We concatenate y-axis average and max pooling: (B, C, H, W) -> (B, 2C, W).
+        self.fc1 = nn.Linear(n_base_filters * 2 * self.CLASSIFIER_X_BINS, 256)
         self.dropout_fc = nn.Dropout(dropout_rate)
         # Note: Added final linear layer for class logits (old Keras code ended with Dropout)
         self.fc2 = nn.Linear(256, num_classes)
@@ -131,6 +134,9 @@ class ModernDeletionCNN(nn.Module):
         return x
 
     def _classify(self, x: torch.Tensor) -> torch.Tensor:
+        avg_y = x.mean(dim=2)
+        max_y = x.amax(dim=2)
+        x = torch.cat((avg_y, max_y), dim=1)
         x = self.flatten(x)
         x = F.relu(self.fc1(x), inplace=True)
         x = self.dropout_fc(x)
