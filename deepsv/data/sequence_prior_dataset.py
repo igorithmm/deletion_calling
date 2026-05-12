@@ -154,10 +154,10 @@ def load_deletion_intervals_from_vcf(
         )
 
     with vcf_ctx as vcf:
-        hg_samples = [s for s in vcf.header.samples if s.startswith("HG")]
+        hg_samples = [s for s in vcf.header.samples if s.startswith(("HG", "NA"))]
         if not hg_samples:
             logger.warning(
-                "Requested HG-only filtering but no samples starting with 'HG' "
+                "Requested HG/NA-only filtering but no samples starting with 'HG' or 'NA' "
                 "found in %s. Keeping all records.",
                 vcf_path,
             )
@@ -167,7 +167,7 @@ def load_deletion_intervals_from_vcf(
                 if wanted is not None and canonical_chrom(record.chrom) not in wanted:
                     continue
 
-                # Filter by HG-sample genotype if any HG samples exist
+                # Filter by sample genotype if any HG/NA samples exist
                 if hg_samples:
                     has_hg = False
                     for s in hg_samples:
@@ -278,7 +278,7 @@ def _load_deletion_intervals_from_text_vcf(
                 header = line.rstrip("\n").split("\t")
                 if len(header) > 9:
                     for i, s in enumerate(header[9:]):
-                        if s.startswith("HG"):
+                        if s.startswith(("HG", "NA")):
                             hg_samples.append(s)
                             sample_indices.append(i + 9)
                 continue
@@ -290,7 +290,7 @@ def _load_deletion_intervals_from_text_vcf(
             if wanted is not None and canonical_chrom(chrom) not in wanted:
                 continue
 
-            # Filter by HG genotype
+            # Filter by HG/NA genotype
             if hg_samples:
                 has_hg = False
                 for idx in sample_indices:

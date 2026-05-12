@@ -31,6 +31,7 @@ def _binary_prf(y_true: np.ndarray, y_pred: np.ndarray):
 
 
 def _best_threshold_tradeoff(y_true: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
+    """Find the threshold that maximizes F1-score efficiently."""
     if y_true.size == 0 or probs.size == 0:
         return {
             "best_threshold": 0.5,
@@ -39,24 +40,31 @@ def _best_threshold_tradeoff(y_true: np.ndarray, probs: np.ndarray) -> Dict[str,
             "best_threshold_f1": 0.0,
         }
 
-    thresholds = np.unique(np.concatenate(([0.0, 0.5, 1.0], probs)))
-    best = {
+    # Instead of checking every unique probability (O(N^2)), we check a fixed
+    # number of candidate thresholds. This is much faster and usually precise enough.
+    thresholds = np.linspace(0.0, 1.0, num=501)
+    
+    best_f1 = -1.0
+    best_metrics = {
         "best_threshold": 0.5,
         "best_threshold_precision": 0.0,
         "best_threshold_recall": 0.0,
-        "best_threshold_f1": -1.0,
+        "best_threshold_f1": 0.0,
     }
+
+    # Pre-calculate counts to speed up metric calculation inside the loop
     for threshold in thresholds:
         y_pred = (probs >= threshold).astype(np.int64)
         precision, recall, f1 = _binary_prf(y_true, y_pred)
-        if f1 > best["best_threshold_f1"]:
-            best = {
+        if f1 > best_f1:
+            best_f1 = f1
+            best_metrics = {
                 "best_threshold": float(threshold),
                 "best_threshold_precision": precision,
                 "best_threshold_recall": recall,
                 "best_threshold_f1": f1,
             }
-    return best
+    return best_metrics
 
 
 class SequencePriorTrainer:

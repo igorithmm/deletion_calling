@@ -68,10 +68,10 @@ def load_manifest(path: str) -> List[dict]:
         reader = csv.DictReader(f)
         for r in reader:
             n_total += 1
-            # Check if any path segment starts with HG (case-sensitive)
-            # e.g. data/fused/HG00096/deletion/...
+            # Check if any path segment starts with HG or NA (case-sensitive)
+            # e.g. data/fused/HG00096/deletion/... or data/fused/NA12878/deletion/...
             path_parts = Path(r["image_path"]).parts
-            if any(p.startswith("HG") for p in path_parts):
+            if any(p.startswith(("HG", "NA")) for p in path_parts):
                 r["position"] = int(r["position"])
                 r["label"] = int(r["label"])
                 r["length"] = int(r["length"])
@@ -80,7 +80,7 @@ def load_manifest(path: str) -> List[dict]:
     n_kept = len(rows)
     if n_total > 0:
         logger.info(
-            "Loaded %d / %d rows from %s (filtered for 'HG' samples)",
+            "Loaded %d / %d rows from %s (filtered for 'HG'/'NA' samples)",
             n_kept,
             n_total,
             path,
