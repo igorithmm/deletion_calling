@@ -8,7 +8,7 @@
 #   1+2+3. Generate fused dataset       (generate_fused_dataset.py)
 #      — Steps 1+2: feature extraction + 3-cluster K-means breakpoint refinement
 #      — Step 3: render 50-bp pileup → 256x256 RGB images + manifest CSV
-#   4a. Train one of M0 / M1 / M2       (train_fused_model.py)
+#   4a. Train one of M0 / M1            (train_fused_model.py)
 #   4b. Run inference, emit predictions + VCF  (call_fused_deletions.py)
 #
 # Usage
@@ -32,7 +32,8 @@ SAMPLE=""
 BAM=""
 VCF=""
 FASTA=""
-MODEL="fused"                      # cnn | fused | embedding
+MODEL="fused"                      # cnn | fused
+FUSION_MODE="film_context"         # film | context | film_context
 CHROMS="20,21,22"
 TRAIN_CHROMS="20,21"
 VAL_CHROMS="22"
@@ -43,6 +44,9 @@ STAGE_A_EPOCHS=2
 BATCH_SIZE=128
 LR_CNN=1e-4
 LR_FILM=1e-3
+INIT_CNN_CHECKPOINT=""
+CONTEXT_HIDDEN_DIM=128
+CONTEXT_DROPOUT=0.1
 THRESHOLD=0.5
 OUT_ROOT="runs/cadc"
 DEVICE="cuda"
@@ -62,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --vcf)            VCF="$2"; shift 2;;
         --fasta)          FASTA="$2"; shift 2;;
         --model)          MODEL="$2"; shift 2;;
+        --fusion-mode)    FUSION_MODE="$2"; shift 2;;
         --chroms)         CHROMS="$2"; shift 2;;
         --train-chroms)   TRAIN_CHROMS="$2"; shift 2;;
         --val-chroms)     VAL_CHROMS="$2"; shift 2;;
@@ -72,6 +77,9 @@ while [[ $# -gt 0 ]]; do
         --batch-size)     BATCH_SIZE="$2"; shift 2;;
         --lr-cnn)         LR_CNN="$2"; shift 2;;
         --lr-film)        LR_FILM="$2"; shift 2;;
+        --init-cnn-checkpoint) INIT_CNN_CHECKPOINT="$2"; shift 2;;
+        --context-hidden-dim) CONTEXT_HIDDEN_DIM="$2"; shift 2;;
+        --context-dropout) CONTEXT_DROPOUT="$2"; shift 2;;
         --threshold)      THRESHOLD="$2"; shift 2;;
         --out-root)       OUT_ROOT="$2"; shift 2;;
         --device)         DEVICE="$2"; shift 2;;
@@ -115,6 +123,7 @@ echo "════════════════════════�
 echo " CADC pipeline"
 echo "   sample      : $SAMPLE"
 echo "   model       : $MODEL"
+echo "   fusion_mode : $FUSION_MODE"
 echo "   bam         : $BAM"
 echo "   vcf         : $VCF"
 echo "   fasta       : ${FASTA:-<n/a>}"
@@ -161,18 +170,28 @@ fi
 # ── Stage 4a: train ────────────────────────────────────────────────────────
 if [[ "$SKIP_TRAIN" -eq 0 ]]; then
     echo "[4a/4] Training $MODEL → $CHECKPOINT"
-    "$PY" scripts/train_fused_model.py \
-        --manifest "$MANIFEST" \
-        --embeddings "$EMBEDDINGS_H5" \
-        --model "$MODEL" \
-        --output "$CHECKPOINT" \
-        --train-chroms "$TRAIN_CHROMS" \
-        --val-chroms "$VAL_CHROMS" \
-        --epochs "$EPOCHS" \
-        --stage-a-epochs "$STAGE_A_EPOCHS" \
-        --batch-size "$BATCH_SIZE" \
-        --lr-cnn "$LR_CNN" \
+    TRAIN_ARGS=(
+        --manifest "$MANIFEST"
+        --embeddings "$EMBEDDINGS_H5"
+        --model "$MODEL"
+        --output "$CHECKPOINT"
+        --train-chroms "$TRAIN_CHROMS"
+        --val-chroms "$VAL_CHROMS"
+        --epochs "$EPOCHS"
+        --stage-a-epochs "$STAGE_A_EPOCHS"
+        --batch-size "$BATCH_SIZE"
+        --lr-cnn "$LR_CNN"
         --lr-film "$LR_FILM"
+    )
+    if [[ "$MODEL" != "cnn" ]]; then
+        TRAIN_ARGS+=(
+            --fusion-mode "$FUSION_MODE"
+            --context-hidden-dim "$CONTEXT_HIDDEN_DIM"
+            --context-dropout "$CONTEXT_DROPOUT"
+        )
+        [[ -n "$INIT_CNN_CHECKPOINT" ]] && TRAIN_ARGS+=(--init-cnn-checkpoint "$INIT_CNN_CHECKPOINT")
+    fi
+    "$PY" scripts/train_fused_model.py "${TRAIN_ARGS[@]}"
 else
     echo "[4a/4] --skip-train set — using existing $CHECKPOINT"
 fi
@@ -189,7 +208,14 @@ if [[ "$SKIP_INFER" -eq 0 ]]; then
         --threshold "$THRESHOLD"
         --sample-id "$SAMPLE"
     )
-    [[ "$MODEL" != "cnn" ]] && INFER_ARGS+=(--embeddings "$EMBEDDINGS_H5")
+    if [[ "$MODEL" != "cnn" ]]; then
+        INFER_ARGS+=(
+            --embeddings "$EMBEDDINGS_H5"
+            --fusion-mode "$FUSION_MODE"
+            --context-hidden-dim "$CONTEXT_HIDDEN_DIM"
+            --context-dropout "$CONTEXT_DROPOUT"
+        )
+    fi
     "$PY" scripts/call_fused_deletions.py "${INFER_ARGS[@]}"
 fi
 

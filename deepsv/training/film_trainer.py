@@ -3,9 +3,9 @@
 Stages
 ──────
 * **Stage A** (default 2 epochs): backbone CNN frozen, FiLM generators only.
-  Single param group at ``lr_film`` (default 1e-3).
+  Single fusion param group at ``lr_film`` (default 1e-3).
 * **Stage B** (remaining epochs): backbone unfrozen, joint training with two
-  param groups: CNN at ``lr_cnn`` (default 1e-4), FiLM at ``lr_film``
+  param groups: CNN at ``lr_cnn`` (default 1e-4), fusion layers at ``lr_film``
   (default 1e-3).
 
 Best checkpoint is selected by **validation F1** (positive class), not
@@ -113,6 +113,25 @@ def _bucket_f1_summary(metrics: Dict[str, float]) -> str:
     return ", ".join(parts)
 
 
+def _metric_suffix(value: object) -> str:
+    text = str(value or "unknown")
+    return "".join(ch if ch.isalnum() else "_" for ch in text).strip("_") or "unknown"
+
+
+def _neg_type_fpr_summary(metrics: Dict[str, float]) -> str:
+    parts = []
+    for key in sorted(metrics):
+        if not key.startswith("fpr_neg_"):
+            continue
+        name = key.removeprefix("fpr_neg_")
+        n_key = f"n_neg_{name}"
+        if n_key in metrics:
+            parts.append(f"{name}={metrics[key]:.3f} (n={int(metrics[n_key])})")
+        else:
+            parts.append(f"{name}={metrics[key]:.3f}")
+    return ", ".join(parts)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Trainer
 # ════════════════════════════════════════════════════════════════════════════
@@ -151,15 +170,18 @@ class FiLMTrainer:
     def _build_stage_a_optimizer(
         self, lr_film: float, film_weight_decay: float
     ) -> None:
-        """Stage A: only FiLM params are trainable."""
+        """Stage A: only embedding-fusion params are trainable."""
         self.model.freeze_backbone()
+        fusion_params = list(self.model.fusion_parameters())
+        if not fusion_params:
+            raise ValueError("Fused model has no trainable fusion parameters.")
         self.optimizer = optim.Adam(
             [
                 {
-                    "params": list(self.model.film_parameters()),
+                    "params": fusion_params,
                     "lr": lr_film,
                     "weight_decay": film_weight_decay,
-                    "name": "film",
+                    "name": "fusion",
                 }
             ],
         )
@@ -173,6 +195,9 @@ class FiLMTrainer:
     ) -> None:
         """Stage B: joint training with two param groups."""
         self.model.unfreeze_backbone()
+        fusion_params = list(self.model.fusion_parameters())
+        if not fusion_params:
+            raise ValueError("Fused model has no trainable fusion parameters.")
         self.optimizer = optim.Adam(
             [
                 {
@@ -182,10 +207,10 @@ class FiLMTrainer:
                     "name": "cnn",
                 },
                 {
-                    "params": list(self.model.film_parameters()),
+                    "params": fusion_params,
                     "lr": lr_film,
                     "weight_decay": film_weight_decay,
-                    "name": "film",
+                    "name": "fusion",
                 },
             ],
         )
@@ -257,6 +282,7 @@ class FiLMTrainer:
         dataloader: DataLoader,
         sample_lengths: Optional[Sequence[int]] = None,
         sample_breakpoint_distances: Optional[Sequence[float]] = None,
+        sample_neg_types: Optional[Sequence[str]] = None,
     ) -> Dict[str, float]:
         """Validate, optionally with stratified metrics.
 
@@ -277,7 +303,8 @@ class FiLMTrainer:
         """
         # Guard against silent misalignment when callers shuffle by accident.
         any_stratified = any(
-            v is not None for v in (sample_lengths, sample_breakpoint_distances)
+            v is not None
+            for v in (sample_lengths, sample_breakpoint_distances, sample_neg_types)
         )
         if any_stratified:
             from torch.utils.data import RandomSampler  # local import
@@ -356,6 +383,21 @@ class FiLMTrainer:
                         np.asarray(sample_breakpoint_distances)[mask].mean()
                     )
 
+        if sample_neg_types is not None and len(sample_neg_types) == n:
+            neg_types = np.asarray(sample_neg_types, dtype=object)
+            for raw_name in sorted({str(x or "unknown") for x in neg_types[y_true == 0]}):
+                if raw_name == "unknown":
+                    type_mask = np.asarray([not x for x in neg_types], dtype=bool)
+                else:
+                    type_mask = neg_types == raw_name
+                mask = (y_true == 0) & type_mask
+                if mask.sum() == 0:
+                    continue
+                suffix = _metric_suffix(raw_name)
+                fp = int(((y_pred == 1) & mask).sum())
+                metrics[f"fpr_neg_{suffix}"] = fp / int(mask.sum())
+                metrics[f"n_neg_{suffix}"] = float(mask.sum())
+
         return metrics
 
     # ------------------------------------------------------------------
@@ -411,7 +453,7 @@ class FiLMTrainer:
         stage_a_epochs = min(stage_a_epochs, num_epochs)
         if stage_a_epochs > 0:
             logger.info(
-                "=== Stage A: FiLM-only (lr=%g, weight_decay=%g) ===",
+                "=== Stage A: fusion-only (lr=%g, weight_decay=%g) ===",
                 lr_film,
                 film_weight_decay,
             )
@@ -449,8 +491,8 @@ class FiLMTrainer:
         stage_b_epochs = num_epochs - stage_a_epochs
         if stage_b_epochs > 0:
             logger.info(
-                "=== Stage B: joint (lr_cnn=%g, lr_film=%g, "
-                "weight_decay_cnn=%g, weight_decay_film=%g) ===",
+                "=== Stage B: joint (lr_cnn=%g, lr_fusion=%g, "
+                "weight_decay_cnn=%g, weight_decay_fusion=%g) ===",
                 lr_cnn,
                 lr_film,
                 weight_decay,
@@ -544,6 +586,9 @@ class FiLMTrainer:
             bucket_summary = _bucket_f1_summary(val_metrics)
             if bucket_summary:
                 logger.info("Val F1 by deletion length: %s", bucket_summary)
+            neg_summary = _neg_type_fpr_summary(val_metrics)
+            if neg_summary:
+                logger.info("Val false-positive rate by negative type: %s", neg_summary)
 
     def _lr_state(self) -> Dict[str, float]:
         if self.optimizer is None:

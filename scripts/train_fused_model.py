@@ -6,7 +6,7 @@ Models
 * **M0** (``--model cnn``) — :class:`ModernDeletionCNN`, image only.
   Standard accuracy-best training via :class:`ModelTrainer`.
   Does NOT require HyenaDNA embeddings.
-* **M1** (``--model fused``) — :class:`FusedDeepSV` with FiLM modulation
+* **M1** (``--model fused``) — :class:`FusedDeepSV` with embedding fusion
   conditioned on a HyenaDNA embedding. Two-stage F1-best training via
   :class:`FiLMTrainer`.
 
@@ -90,7 +90,61 @@ def manifest_to_lists(rows: List[dict]) -> Dict[str, list]:
         "chroms": [r["chrom"] for r in rows],
         "positions": [r["position"] for r in rows],
         "lengths": [r["length"] for r in rows],
+        "neg_types": [r.get("neg_type", "") for r in rows],
     }
+
+
+def load_torch_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    """Load a plain state_dict, accepting common checkpoint wrappers."""
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+
+    if isinstance(state, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    if not isinstance(state, dict):
+        raise TypeError(f"Checkpoint {path!r} did not contain a state_dict.")
+
+    cleaned = {
+        k.removeprefix("module."): v
+        for k, v in state.items()
+        if isinstance(k, str) and torch.is_tensor(v)
+    }
+    if not cleaned:
+        raise TypeError(f"Checkpoint {path!r} did not contain tensor weights.")
+    return cleaned
+
+
+def load_cnn_backbone(path: str) -> ModernDeletionCNN:
+    """Create a CNN backbone initialized from an M0 or fused checkpoint."""
+    backbone = ModernDeletionCNN(num_classes=2)
+    state = load_torch_state_dict(path)
+
+    if any(k.startswith("cnn.") for k in state):
+        state = {
+            k.removeprefix("cnn."): v
+            for k, v in state.items()
+            if k.startswith("cnn.")
+        }
+
+    missing, unexpected = backbone.load_state_dict(state, strict=False)
+    if missing:
+        raise RuntimeError(
+            "Could not initialize CNN backbone; missing keys from checkpoint "
+            f"{path!r}: {missing}"
+        )
+    if unexpected:
+        logger.warning(
+            "Ignoring non-CNN keys while initializing backbone from %s: %s",
+            path,
+            unexpected,
+        )
+    logger.info("Initialized fused CNN backbone from %s", path)
+    return backbone
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,33 +252,61 @@ def train_m0(train_rows, val_rows, args) -> None:
         val_loader=val_loader,
         num_epochs=args.epochs,
         save_path=Path(args.output),
-        validate_kwargs={"sample_lengths": va["lengths"]},
+        validate_kwargs={
+            "sample_lengths": va["lengths"],
+            "sample_neg_types": va["neg_types"],
+        },
         max_grad_norm=args.max_grad_norm,
     )
 
 
 def train_m1(train_rows, val_rows, args) -> None:
-    """Fused CNN + FiLM (main contribution)."""
-    train_loader, val_loader, _, val_ds = build_loaders(
+    """Fused CNN + sequence embedding context."""
+    train_loader, val_loader, _, _ = build_loaders(
         train_rows, val_rows, args.embeddings, args.batch_size, args.num_workers
     )
 
     val_va = manifest_to_lists(val_rows)
     validate_kwargs = {
         "sample_lengths": val_va["lengths"],
+        "sample_neg_types": val_va["neg_types"],
     }
+
+    backbone = (
+        load_cnn_backbone(args.init_cnn_checkpoint)
+        if args.init_cnn_checkpoint
+        else None
+    )
 
     model = FusedDeepSV(
         embed_dim=args.embed_dim,
         num_classes=2,
         film_dropout_rate=args.film_dropout,
+        fusion_mode=args.fusion_mode,
+        context_hidden_dim=args.context_hidden_dim,
+        context_dropout_rate=args.context_dropout,
+        backbone=backbone,
     )
     trainer = FiLMTrainer(model)
+
+    stage_a_epochs = args.stage_a_epochs
+    if (
+        backbone is None
+        and stage_a_epochs > 0
+        and not args.allow_random_stage_a
+    ):
+        logger.warning(
+            "No --init-cnn-checkpoint was provided, so Stage A would freeze a "
+            "random CNN backbone. Setting effective stage_a_epochs=0. Pass "
+            "--allow-random-stage-a to keep the old behavior."
+        )
+        stage_a_epochs = 0
+
     trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
         num_epochs=args.epochs,
-        stage_a_epochs=args.stage_a_epochs,
+        stage_a_epochs=stage_a_epochs,
         lr_cnn=args.lr_cnn,
         lr_film=args.lr_film,
         weight_decay=args.weight_decay,
@@ -257,7 +339,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         choices=["cnn", "fused"],
         default="fused",
-        help="cnn=M0 (image only), fused=M1 (image + HyenaDNA FiLM, default)",
+        help="cnn=M0 (image only), fused=M1 (image + HyenaDNA context, default)",
     )
     p.add_argument("--output", required=True, help="Path to save the best checkpoint")
     p.add_argument(
@@ -275,6 +357,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--embed-dim", type=int, default=256)
+    p.add_argument(
+        "--fusion-mode",
+        choices=["film", "context", "film_context"],
+        default="film_context",
+        help=(
+            "Embedding fusion for --model fused. film=original FiLM only; "
+            "context=late deletion-logit calibration only; film_context=both "
+            "(default)."
+        ),
+    )
+    p.add_argument(
+        "--init-cnn-checkpoint",
+        default=None,
+        help=(
+            "Optional M0/CNN checkpoint used to warm-start the fused backbone. "
+            "Recommended before using Stage A."
+        ),
+    )
+    p.add_argument(
+        "--allow-random-stage-a",
+        action="store_true",
+        help=(
+            "Keep Stage A even without --init-cnn-checkpoint. By default, "
+            "Stage A is skipped when the CNN backbone is random."
+        ),
+    )
     p.add_argument("--lr-cnn", type=float, default=1e-4)
     p.add_argument("--lr-film", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-6)
@@ -289,6 +397,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="Dropout probability inside FiLM generators (default: 0.1)",
+    )
+    p.add_argument(
+        "--context-hidden-dim",
+        type=int,
+        default=128,
+        help="Hidden width for context calibration heads (default: 128)",
+    )
+    p.add_argument(
+        "--context-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability inside context calibration heads (default: 0.1)",
     )
     p.add_argument(
         "--max-grad-norm",

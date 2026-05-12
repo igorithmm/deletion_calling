@@ -1,5 +1,7 @@
 """PyTorch CNN model for deletion detection"""
 
+from typing import Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +17,7 @@ class ModernDeletionCNN(nn.Module):
     BLOCK3_CHANNELS: int = 96
     BLOCK4_CHANNELS: int = 96
     CLASSIFIER_X_BINS: int = 16
+    CLASSIFIER_FEATURES: int = 256
 
     def __init__(
         self,
@@ -81,10 +84,13 @@ class ModernDeletionCNN(nn.Module):
         # Preserve the genomic x-axis while summarising the pileup y-axis.
         # For 255x255 or 256x256 input, 4 pools of 2x2 reduce x to 16 bins.
         # We concatenate y-axis average and max pooling: (B, C, H, W) -> (B, 2C, W).
-        self.fc1 = nn.Linear(n_base_filters * 2 * self.CLASSIFIER_X_BINS, 256)
+        self.fc1 = nn.Linear(
+            n_base_filters * 2 * self.CLASSIFIER_X_BINS,
+            self.CLASSIFIER_FEATURES,
+        )
         self.dropout_fc = nn.Dropout(dropout_rate)
         # Note: Added final linear layer for class logits (old Keras code ended with Dropout)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.fc2 = nn.Linear(self.CLASSIFIER_FEATURES, num_classes)
 
         self._initialize_weights()
 
@@ -133,22 +139,28 @@ class ModernDeletionCNN(nn.Module):
         x = self.drop5(x)
         return x
 
-    def _classify(self, x: torch.Tensor) -> torch.Tensor:
+    def _classifier_features(self, x: torch.Tensor) -> torch.Tensor:
         avg_y = x.mean(dim=2)
         max_y = x.amax(dim=2)
         x = torch.cat((avg_y, max_y), dim=1)
         x = self.flatten(x)
         x = F.relu(self.fc1(x), inplace=True)
         x = self.dropout_fc(x)
-        x = self.fc2(x)
         return x
+
+    def _classify_from_features(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(x)
+
+    def _classify(self, x: torch.Tensor) -> torch.Tensor:
+        return self._classify_from_features(self._classifier_features(x))
 
     def _forward_features_with_hooks(
         self,
         x: torch.Tensor,
         hook3=None,
         hook4=None,
-    ) -> torch.Tensor:
+        return_classifier_features: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         x = self._block1(x)
         x = self._block2(x)
 
@@ -161,8 +173,11 @@ class ModernDeletionCNN(nn.Module):
             x = hook4(x)
 
         x = self._block5(x)
-        x = self._classify(x)
-        return x
+        classifier_features = self._classifier_features(x)
+        logits = self._classify_from_features(classifier_features)
+        if return_classifier_features:
+            return logits, classifier_features
+        return logits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.

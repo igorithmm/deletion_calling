@@ -49,8 +49,8 @@ from deepsv.inference import FusedPredictor
 from deepsv.inference.predictor import DeletionPredictor
 from deepsv.models import ModernDeletionCNN, FusedDeepSV
 
-# Reuse the manifest loader from the training script.
-from train_fused_model import load_manifest  # type: ignore  # noqa: E402
+# Reuse manifest/checkpoint helpers from the training script.
+from train_fused_model import load_manifest, load_torch_state_dict  # type: ignore  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,7 +72,7 @@ def predict_m0(
 ) -> List[Tuple[float, int]]:
     """Image-only inference."""
     model = ModernDeletionCNN(num_classes=2)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    state = load_torch_state_dict(checkpoint)
     model.load_state_dict(state)
     predictor = DeletionPredictor(model=model, threshold=threshold)
     image_paths = [Path(r["image_path"]) for r in rows]
@@ -86,11 +86,33 @@ def predict_m1(
     threshold: float,
     batch_size: int,
     embed_dim: int,
+    fusion_mode: str,
+    context_hidden_dim: int,
+    context_dropout: float,
 ) -> List[Tuple[float, int]]:
     """Fused (image + embedding) inference."""
-    model = FusedDeepSV(embed_dim=embed_dim, num_classes=2)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    model.load_state_dict(state)
+    model = FusedDeepSV(
+        embed_dim=embed_dim,
+        num_classes=2,
+        fusion_mode=fusion_mode,
+        context_hidden_dim=context_hidden_dim,
+        context_dropout_rate=context_dropout,
+    )
+    state = load_torch_state_dict(checkpoint)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        logger.warning(
+            "Checkpoint is missing %d model keys; newly initialized keys stay at "
+            "their default values. First few missing keys: %s",
+            len(missing),
+            missing[:8],
+        )
+    if unexpected:
+        logger.warning(
+            "Checkpoint has %d unexpected keys ignored by this model. First few: %s",
+            len(unexpected),
+            unexpected[:8],
+        )
 
     chroms_in_manifest = sorted({r["chrom"] for r in rows})
     with FusedPredictor(
@@ -207,6 +229,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--embed-dim", type=int, default=256)
+    p.add_argument(
+        "--fusion-mode",
+        choices=["film", "context", "film_context"],
+        default="film_context",
+        help=(
+            "Embedding fusion used by the fused checkpoint. Match the training "
+            "setting when using non-default modes."
+        ),
+    )
+    p.add_argument(
+        "--context-hidden-dim",
+        type=int,
+        default=128,
+        help="Hidden width for context calibration heads (default: 128)",
+    )
+    p.add_argument(
+        "--context-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability for context heads; inactive during eval.",
+    )
     p.add_argument("--sample-id", default="SAMPLE")
     return p.parse_args()
 
@@ -229,6 +272,9 @@ def main() -> None:
             args.threshold,
             args.batch_size,
             args.embed_dim,
+            args.fusion_mode,
+            args.context_hidden_dim,
+            args.context_dropout,
         )
 
     # Per-window predictions CSV.

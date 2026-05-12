@@ -72,6 +72,25 @@ def _bucket_f1_summary(metrics: Dict[str, float]) -> str:
     return ", ".join(parts)
 
 
+def _metric_suffix(value: object) -> str:
+    text = str(value or "unknown")
+    return "".join(ch if ch.isalnum() else "_" for ch in text).strip("_") or "unknown"
+
+
+def _neg_type_fpr_summary(metrics: Dict[str, float]) -> str:
+    parts = []
+    for key in sorted(metrics):
+        if not key.startswith("fpr_neg_"):
+            continue
+        name = key.removeprefix("fpr_neg_")
+        n_key = f"n_neg_{name}"
+        if n_key in metrics:
+            parts.append(f"{name}={metrics[key]:.3f} (n={int(metrics[n_key])})")
+        else:
+            parts.append(f"{name}={metrics[key]:.3f}")
+    return ", ".join(parts)
+
+
 class ImageDataset(Dataset):
     """Dataset for loading images and labels"""
     
@@ -214,9 +233,11 @@ class ModelTrainer:
         }
     
     def validate(
-            self,
-            dataloader: DataLoader,
-            sample_lengths: Optional[Sequence[int]] = None) -> Dict[str, float]:
+        self,
+        dataloader: DataLoader,
+        sample_lengths: Optional[Sequence[int]] = None,
+        sample_neg_types: Optional[Sequence[str]] = None,
+    ) -> Dict[str, float]:
         """
         Validate model
         
@@ -286,6 +307,21 @@ class ModelTrainer:
                 metrics[f"f1_len_{name}"] = bucket_f1
                 metrics[f"precision_len_{name}"] = p
                 metrics[f"recall_len_{name}"] = r
+
+        if sample_neg_types is not None and len(sample_neg_types) == len(y_true):
+            neg_types = np.asarray(sample_neg_types, dtype=object)
+            for raw_name in sorted({str(x or "unknown") for x in neg_types[y_true == 0]}):
+                if raw_name == "unknown":
+                    type_mask = np.asarray([not x for x in neg_types], dtype=bool)
+                else:
+                    type_mask = neg_types == raw_name
+                mask = (y_true == 0) & type_mask
+                if mask.sum() == 0:
+                    continue
+                suffix = _metric_suffix(raw_name)
+                fp = int(((y_pred == 1) & mask).sum())
+                metrics[f"fpr_neg_{suffix}"] = fp / int(mask.sum())
+                metrics[f"n_neg_{suffix}"] = float(mask.sum())
 
         return metrics
     
@@ -357,6 +393,9 @@ class ModelTrainer:
                 bucket_summary = _bucket_f1_summary(val_metrics)
                 if bucket_summary:
                     logger.info("Val F1 by deletion length: %s", bucket_summary)
+                neg_summary = _neg_type_fpr_summary(val_metrics)
+                if neg_summary:
+                    logger.info("Val false-positive rate by negative type: %s", neg_summary)
                 
                 # Save best model based on F1 instead of accuracy
                 if val_metrics['f1'] > best_val_f1:

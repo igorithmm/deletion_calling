@@ -14,7 +14,7 @@ Two operating modes are supported:
 ## Table of Contents
 
 1. [Algorithm Overview](#algorithm-overview)
-2. [FiLM + HyenaDNA (M1 mode)](#film--hyenadna-m1-mode)
+2. [Fusion + HyenaDNA (M1 mode)](#fusion--hyenadna-m1-mode)
 3. [Project Structure](#project-structure)
 4. [Installation](#installation)
 5. [Data Requirements](#data-requirements)
@@ -57,13 +57,22 @@ Step 4b Inference               per-window probabilities → merged DEL calls �
 
 ---
 
-## FiLM + HyenaDNA (M1 mode)
+## Fusion + HyenaDNA (M1 mode)
 
-M1 adds a **second modality**: frozen sequence embeddings from **HyenaDNA** fused with CNN features through **FiLM conditioning** (Feature-wise Linear Modulation, Perez et al. 2018). Both **HyenaDNA-small-32k** (256-dim) and **HyenaDNA-tiny-16k** (128-dim) models are supported.
+M1 adds a **second modality**: frozen sequence embeddings from **HyenaDNA** fused with CNN features through FiLM conditioning and/or late context calibration. Both **HyenaDNA-small-32k** (256-dim) and **HyenaDNA-tiny-16k** (128-dim) models are supported.
 
 ### Why it helps
 
-The baseline CNN (M0) sees only the pileup image. The same genomic position carries its own *sequence context* (motifs, repeats, GC content) that partly explains how likely a deletion signal is. The HyenaDNA embedding provides a compressed 128 or 256-dimensional description of this context, and FiLM lets it **modulate CNN feature maps on the fly** without changing the underlying architecture.
+The baseline CNN (M0) sees only the pileup image. The same genomic position carries its own *sequence context* (motifs, repeats, GC content) that partly explains how likely a deletion signal is. The HyenaDNA embedding provides a compressed 128 or 256-dimensional description of this context.
+
+The recommended `film_context` mode uses two paths:
+
+| Path | What it does |
+|------|--------------|
+| FiLM | Modulates mid-level CNN feature maps from the embedding |
+| Context calibration | Adds a learned embedding-conditioned delta to the deletion logit |
+
+The calibration path is meant for false-positive-prone regions: if the pileup looks deletion-like but the surrounding sequence context is dangerous, the embedding branch can learn a negative logit delta and reduce `P(deletion)`.
 
 ### FiLM equation
 
@@ -74,7 +83,7 @@ For a feature map `F` of shape `(B, C, H, W)`:
 F_out = F × (1 + γ.view(B,C,1,1)) + β.view(B,C,1,1)
 ```
 
-Each `FiLMGenerator` is a two-layer MLP `Linear(D→128) → ReLU → Linear(128→2·C)` (where D is 128 or 256). **The final Linear is zero-initialised** (weights and biases), so at step 0 γ = β = 0 and FiLM is an **exact identity**: `F_out = F`. Training starts from baseline M0 behaviour and deviates only as the FiLM heads learn.
+Each `FiLMGenerator` is a two-layer MLP `Linear(D→128) → ReLU → Linear(128→2·C)` (where D is 128 or 256). **The final Linear is zero-initialised** (weights and biases), so at step 0 γ = β = 0 and FiLM is an **exact identity**: `F_out = F`. The context calibration heads are also zero-initialized, so training starts from CNN behavior and deviates only as embedding-fusion heads learn.
 
 ### Injection points (ModernDeletionCNN)
 
@@ -90,8 +99,10 @@ Each `FiLMGenerator` is a two-layer MLP `Linear(D→128) → ReLU → Linear(128
 
 Implemented in `deepsv/training/film_trainer.py`:
 
-- **Stage A** (default 2 epochs): backbone frozen, FiLM generators only. Single param group at `lr_film = 1e-3`.
-- **Stage B** (remaining epochs): backbone unfrozen, two param groups — CNN @ `lr_cnn = 1e-4`, FiLM @ `lr_film = 1e-3`.
+- **Stage A** (default 2 epochs with `--init-cnn-checkpoint`): backbone frozen, embedding-fusion heads only. Single param group at `lr_film = 1e-3`.
+- **Stage B** (remaining epochs): backbone unfrozen, two param groups — CNN @ `lr_cnn = 1e-4`, fusion heads @ `lr_film = 1e-3`.
+
+Stage A is most useful when M1 is warm-started from a trained M0 checkpoint. Without `--init-cnn-checkpoint`, the trainer skips Stage A by default because freezing a random CNN backbone does not test whether context improves a meaningful image baseline.
 
 Best checkpoint is selected by **validation F1** (positive class), not accuracy. Loss = `nn.CrossEntropyLoss` on the 2-logit softmax head, with **automatic class-weighting** to handle dataset imbalance.
 
@@ -134,6 +145,7 @@ Lookup: `emb = f["chr21"][position // 50]`. For GPU-constrained nodes, specified
 `FiLMTrainer.validate(...)` reports per-bucket precision / recall / F1 across:
 
 - **Deletion length**: `50–200`, `200–500`, `500–1k`, `1k–5k`, `5k–10k` bp.
+- **Negative source**: false-positive rate for `anchor`, `regional`, and `random` negative windows when the manifest includes `neg_type`.
 
 ---
 
@@ -286,13 +298,15 @@ python scripts/train_fused_model.py \
     --output models/m0_best.pth \
     --epochs 10
 
-# M1: Fused (image + HyenaDNA FiLM)
+# M1: Fused (image + HyenaDNA context), warm-started from M0
 python scripts/train_fused_model.py \
     --manifest     data/fused/NA12878/manifest.csv \
     --model        fused \
     --embeddings   data/hyenadna_embeddings.h5 \
     --train-chroms 20,21 --val-chroms 22 \
     --output       models/m1_best.pth \
+    --init-cnn-checkpoint models/m0_best.pth \
+    --fusion-mode film_context \
     --epochs       10 \
     --stage-a-epochs 2 \
     --lr-cnn  1e-4 \
@@ -376,12 +390,15 @@ Use `--skip-precompute`, `--skip-generate`, `--skip-train`, `--skip-infer` to re
 | `--train-chroms` | *required* | Comma-separated training chromosomes |
 | `--val-chroms` | *required* | Comma-separated validation chromosomes |
 | `--epochs` | `10` | Total training epochs |
-| `--stage-a-epochs` | `2` | FiLM-only warm-up epochs (M1 only) |
+| `--stage-a-epochs` | `2` | Fusion-only warm-up epochs when an M0 checkpoint is provided |
 | `--batch-size` | `128` | Batch size |
+| `--fusion-mode` | `film_context` | `film`, `context`, or both |
+| `--init-cnn-checkpoint` | *none* | Optional M0/fused checkpoint to warm-start the CNN backbone |
 | `--lr-cnn` | `1e-4` | CNN backbone learning rate (Stage B) |
-| `--lr-film` | `1e-3` | FiLM generator learning rate (both stages) |
+| `--lr-film` | `1e-3` | Embedding-fusion learning rate (both stages) |
 | `--weight-decay` | `1e-6` | L2 regularisation |
 | `--embed-dim` | `256` | HyenaDNA embedding dimension |
+| `--context-hidden-dim` | `128` | Hidden width for late context calibration heads |
 
 ### `call_fused_deletions.py`
 
@@ -396,6 +413,8 @@ Use `--skip-precompute`, `--skip-generate`, `--skip-train`, `--skip-infer` to re
 | `--threshold` | `0.5` | P(deletion) threshold for positive classification |
 | `--batch-size` | `64` | Inference batch size |
 | `--embed-dim` | `256` | Must match training value |
+| `--fusion-mode` | `film_context` | Must match training when using non-default modes |
+| `--context-hidden-dim` | `128` | Must match training if changed |
 
 ---
 
@@ -440,7 +459,12 @@ train_ds = FusedDataset(
     preload_chroms=["20", "21"],
     transform=transform,
 )
-model_m1 = FusedDeepSV(embed_dim=256, num_classes=2)
+model_m1 = FusedDeepSV(
+    embed_dim=256,
+    num_classes=2,
+    fusion_mode="film_context",
+    backbone=model_m0,
+)
 trainer_m1 = FiLMTrainer(model_m1)
 trainer_m1.train(
     train_loader=DataLoader(train_ds, batch_size=128, shuffle=True),
