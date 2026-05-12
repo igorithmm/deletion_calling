@@ -221,7 +221,7 @@ def embed_chunk(
 def precompute(
     fasta_path: str,
     output_path: str,
-    model_path: str = NTV2_MODEL_PATH,
+    model_id: str = NTV2_MODEL_PATH,
     device: str = "cuda",
     chroms: list[str] | None = None,
     genome_build: str = "",
@@ -260,10 +260,10 @@ def precompute(
     ref_md5 = fasta_md5(fasta_path)
     logger.info("Reference MD5: %s", ref_md5)
 
-    model, tokenizer = load_model(model_path, device)
+    model, tokenizer = load_model(model_id, device)
 
     hdf = h5py.File(str(output_file), "a")
-    hdf.attrs["model_id"] = model_path
+    hdf.attrs["model_id"] = model_id
     hdf.attrs["window_bp"] = WINDOW_BP
     hdf.attrs["flank_bp"] = FLANK_BP
     hdf.attrs["core_bp"] = CORE_BP
@@ -335,7 +335,7 @@ def main():
     parser.add_argument("--fasta", required=True, help="Path to reference FASTA")
     parser.add_argument("--output", required=True, help="Output HDF5 file path")
     parser.add_argument(
-        "--model-path",
+        "--model-id",
         default=NTV2_MODEL_PATH,
         help="Local path to NTV2 model",
     )
@@ -365,7 +365,7 @@ def main():
     precompute(
         fasta_path=args.fasta,
         output_path=args.output,
-        model_path=args.model_path,
+        model_id=args.model_id,
         device=args.device,
         chroms=args.chrom,
         genome_build=args.genome_build,
