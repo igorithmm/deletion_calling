@@ -3,10 +3,12 @@
 from .cnn import ModernDeletionCNN
 from .film import FiLMGenerator, apply_film
 from .fused_cnn import FusedDeepSV
+from .sequence_prior import SequenceDeletionPrior
 
 __all__ = [
     "ModernDeletionCNN",
     "FiLMGenerator",
     "apply_film",
     "FusedDeepSV",
+    "SequenceDeletionPrior",
 ]

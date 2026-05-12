@@ -34,6 +34,7 @@ setup(
             "cadc-generate=scripts.generate_fused_dataset:main",
             "cadc-precompute=scripts.precompute_hyenadna_embeddings:main",
             "cadc-train=scripts.train_fused_model:main",
+            "cadc-train-prior=scripts.train_sequence_prior:main",
             "cadc-call=scripts.call_fused_deletions:main",
         ],
     },

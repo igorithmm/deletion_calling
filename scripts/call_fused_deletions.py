@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -45,12 +46,15 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deepsv.inference import FusedPredictor
+from deepsv.inference import FusedPredictor, SequencePriorPredictor
 from deepsv.inference.predictor import DeletionPredictor
 from deepsv.models import ModernDeletionCNN, FusedDeepSV
 
 # Reuse manifest/checkpoint helpers from the training script.
-from train_fused_model import load_manifest, load_torch_state_dict  # type: ignore  # noqa: E402
+try:
+    from train_fused_model import load_manifest, load_torch_state_dict  # type: ignore  # noqa: E402
+except ModuleNotFoundError:
+    from scripts.train_fused_model import load_manifest, load_torch_state_dict  # type: ignore  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,6 +131,56 @@ def predict_m1(
             positions=[r["position"] for r in rows],
             batch_size=batch_size,
         )
+
+
+def _prob_to_logit(prob: float, eps: float = 1e-6) -> float:
+    p = min(max(float(prob), eps), 1.0 - eps)
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def apply_sequence_prior(
+    rows: List[dict],
+    base_preds: List[Tuple[float, int]],
+    embeddings_h5: str,
+    prior_checkpoint: str,
+    prior_weight: float,
+    prior_bias: float,
+    threshold: float,
+    batch_size: int,
+    context_radius: Optional[int],
+    preload: bool,
+) -> Tuple[List[Tuple[float, int]], List[Tuple[float, float]]]:
+    """Mix base model probabilities with a sequence-prior checkpoint."""
+    chroms = [r["chrom"] for r in rows]
+    positions = [int(r["position"]) for r in rows]
+    preload_chroms = sorted({r["chrom"] for r in rows}) if preload else None
+
+    with SequencePriorPredictor.from_checkpoint(
+        checkpoint=prior_checkpoint,
+        embeddings_h5=embeddings_h5,
+        context_radius=context_radius,
+        preload_chroms=preload_chroms,
+    ) as predictor:
+        prior_scores = predictor.predict_batch(
+            chroms=chroms,
+            positions=positions,
+            batch_size=batch_size,
+        )
+
+    final_preds: List[Tuple[float, int]] = []
+    for (base_prob, _), (_, prior_logit) in zip(base_preds, prior_scores):
+        final_logit = _prob_to_logit(base_prob) + prior_weight * prior_logit + prior_bias
+        final_prob = _sigmoid(final_logit)
+        final_preds.append((final_prob, 1 if final_prob > threshold else 0))
+    return final_preds, prior_scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,6 +304,34 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Dropout probability for context heads; inactive during eval.",
     )
+    p.add_argument(
+        "--sequence-prior-checkpoint",
+        default=None,
+        help="Optional SequenceDeletionPrior checkpoint to mix into final scores.",
+    )
+    p.add_argument(
+        "--sequence-prior-weight",
+        type=float,
+        default=1.0,
+        help="Weight for prior logit in final_logit = base_logit + w * prior_logit + b.",
+    )
+    p.add_argument(
+        "--sequence-prior-bias",
+        type=float,
+        default=0.0,
+        help="Bias term added after sequence-prior logit mixing.",
+    )
+    p.add_argument(
+        "--sequence-prior-context-radius",
+        type=int,
+        default=None,
+        help="Override context radius stored in the prior checkpoint.",
+    )
+    p.add_argument(
+        "--sequence-prior-preload",
+        action="store_true",
+        help="Preload manifest chromosomes from the embedding H5 for prior scoring.",
+    )
     p.add_argument("--sample-id", default="SAMPLE")
     return p.parse_args()
 
@@ -261,11 +343,13 @@ def main() -> None:
 
     if args.model == "fused" and not args.embeddings:
         raise SystemExit("--embeddings is required for --model fused")
+    if args.sequence_prior_checkpoint and not args.embeddings:
+        raise SystemExit("--embeddings is required for --sequence-prior-checkpoint")
 
     if args.model == "cnn":
-        preds = predict_m0(rows, args.checkpoint, args.threshold, args.batch_size)
+        base_preds = predict_m0(rows, args.checkpoint, args.threshold, args.batch_size)
     else:  # fused
-        preds = predict_m1(
+        base_preds = predict_m1(
             rows,
             args.checkpoint,
             args.embeddings,
@@ -277,33 +361,85 @@ def main() -> None:
             args.context_dropout,
         )
 
+    preds = base_preds
+    prior_scores: Optional[List[Tuple[float, float]]] = None
+    if args.sequence_prior_checkpoint:
+        preds, prior_scores = apply_sequence_prior(
+            rows=rows,
+            base_preds=base_preds,
+            embeddings_h5=args.embeddings,
+            prior_checkpoint=args.sequence_prior_checkpoint,
+            prior_weight=args.sequence_prior_weight,
+            prior_bias=args.sequence_prior_bias,
+            threshold=args.threshold,
+            batch_size=args.batch_size,
+            context_radius=args.sequence_prior_context_radius,
+            preload=args.sequence_prior_preload,
+        )
+
     # Per-window predictions CSV.
     Path(args.predictions_out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.predictions_out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(
-            [
-                "image_path",
-                "chrom",
-                "position",
-                "label",
-                "length",
-                "prob_deletion",
-                "predicted_class",
-            ]
-        )
-        for r, (prob, cls) in zip(rows, preds):
+        if prior_scores is None:
             w.writerow(
                 [
-                    r["image_path"],
-                    r["chrom"],
-                    r["position"],
-                    r["label"],
-                    r["length"],
-                    f"{prob:.6f}",
-                    cls,
+                    "image_path",
+                    "chrom",
+                    "position",
+                    "label",
+                    "length",
+                    "prob_deletion",
+                    "predicted_class",
                 ]
             )
+            for r, (prob, cls) in zip(rows, preds):
+                w.writerow(
+                    [
+                        r["image_path"],
+                        r["chrom"],
+                        r["position"],
+                        r["label"],
+                        r["length"],
+                        f"{prob:.6f}",
+                        cls,
+                    ]
+                )
+        else:
+            w.writerow(
+                [
+                    "image_path",
+                    "chrom",
+                    "position",
+                    "label",
+                    "length",
+                    "base_prob_deletion",
+                    "sequence_prior_prob",
+                    "sequence_prior_logit",
+                    "prob_deletion",
+                    "predicted_class",
+                ]
+            )
+            for r, (base_prob, _), (prior_prob, prior_logit), (prob, cls) in zip(
+                rows,
+                base_preds,
+                prior_scores,
+                preds,
+            ):
+                w.writerow(
+                    [
+                        r["image_path"],
+                        r["chrom"],
+                        r["position"],
+                        r["label"],
+                        r["length"],
+                        f"{base_prob:.6f}",
+                        f"{prior_prob:.6f}",
+                        f"{prior_logit:.6f}",
+                        f"{prob:.6f}",
+                        cls,
+                    ]
+                )
     logger.info("Wrote per-window predictions to %s", args.predictions_out)
 
     # Optional VCF output.

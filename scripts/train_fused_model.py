@@ -58,15 +58,33 @@ logger = logging.getLogger(__name__)
 
 
 def load_manifest(path: str) -> List[dict]:
-    """Read the manifest CSV into a list of row dicts."""
+    """Read the manifest CSV into a list of row dicts.
+
+    Only samples with the 'HG' prefix (e.g. HG00096) are kept.
+    """
     rows: List[dict] = []
+    n_total = 0
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
-            r["position"] = int(r["position"])
-            r["label"] = int(r["label"])
-            r["length"] = int(r["length"])
-            rows.append(r)
+            n_total += 1
+            # Check if any path segment starts with HG (case-sensitive)
+            # e.g. data/fused/HG00096/deletion/...
+            path_parts = Path(r["image_path"]).parts
+            if any(p.startswith("HG") for p in path_parts):
+                r["position"] = int(r["position"])
+                r["label"] = int(r["label"])
+                r["length"] = int(r["length"])
+                rows.append(r)
+
+    n_kept = len(rows)
+    if n_total > 0:
+        logger.info(
+            "Loaded %d / %d rows from %s (filtered for 'HG' samples)",
+            n_kept,
+            n_total,
+            path,
+        )
     return rows
 
 

@@ -341,6 +341,34 @@ python scripts/call_fused_deletions.py \
 
 Adjacent positive windows on the same chromosome are merged into single deletion calls. The output VCF contains `SVTYPE=DEL`, `END`, `SVLEN`, `NWIN` (number of merged windows), and `MAXPROB` (max deletion probability).
 
+### Optional sequence prior
+
+Train a reference-sequence prior directly from the population SV VCF and the
+precomputed reference embeddings:
+
+```bash
+python scripts/train_sequence_prior.py \
+    --embeddings    data/hyenadna_embeddings.h5 \
+    --vcf           raw/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.vcf.gz \
+    --train-chroms  20,21 \
+    --val-chroms    22 \
+    --output        models/sequence_prior_best.pth
+```
+
+Then mix it into either the CNN-only or fused caller by adding its deletion
+logit to the base model logit:
+
+```bash
+python scripts/call_fused_deletions.py \
+    --manifest                   data/fused/NA12878/manifest.csv \
+    --model                      fused \
+    --checkpoint                 models/m1_best.pth \
+    --embeddings                 data/hyenadna_embeddings.h5 \
+    --sequence-prior-checkpoint  models/sequence_prior_best.pth \
+    --sequence-prior-weight      1.0 \
+    --predictions-out            runs/m1_prior_predictions.csv
+```
+
 ---
 
 ### Full pipeline (one command)
@@ -400,6 +428,20 @@ Use `--skip-precompute`, `--skip-generate`, `--skip-train`, `--skip-infer` to re
 | `--embed-dim` | `256` | HyenaDNA embedding dimension |
 | `--context-hidden-dim` | `128` | Hidden width for late context calibration heads |
 
+### `train_sequence_prior.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--embeddings` | *required* | Reference embedding HDF5 from `precompute_hyenadna_embeddings.py` |
+| `--vcf` | *required* | Population SV VCF.gz with DEL records |
+| `--output` | *required* | Path to save best prior checkpoint |
+| `--train-chroms` | *auto* | Comma-separated training chromosomes |
+| `--val-chroms` | `22` if present | Validation chromosomes |
+| `--positive-mode` | `span` | How DEL intervals become positive windows |
+| `--context-radius` | `10` | Number of neighbouring H5 windows on each side |
+| `--negative-ratio` | `1.0` | Negatives sampled per positive |
+| `--negative-margin-bp` | `1000` | Exclusion margin around known DEL intervals |
+
 ### `call_fused_deletions.py`
 
 | Argument | Default | Description |
@@ -415,6 +457,9 @@ Use `--skip-precompute`, `--skip-generate`, `--skip-train`, `--skip-infer` to re
 | `--embed-dim` | `256` | Must match training value |
 | `--fusion-mode` | `film_context` | Must match training when using non-default modes |
 | `--context-hidden-dim` | `128` | Must match training if changed |
+| `--sequence-prior-checkpoint` | *none* | Optional sequence-prior checkpoint trained from H5 + SV VCF |
+| `--sequence-prior-weight` | `1.0` | Weight for adding the prior logit to the base logit |
+| `--sequence-prior-bias` | `0.0` | Optional bias after logit mixing |
 
 ---
 
