@@ -123,7 +123,10 @@ class SequencePriorTrainer:
         all_probs = []
 
         pbar = tqdm(dataloader, desc="Training sequence prior", leave=False)
-        for embeddings, labels in pbar:
+        log_interval = 200
+        total_batches = len(dataloader)
+
+        for i, (embeddings, labels) in enumerate(pbar):
             embeddings = embeddings.to(self.device, non_blocking=True).float()
             labels = labels.to(self.device, non_blocking=True)
 
@@ -142,7 +145,17 @@ class SequencePriorTrainer:
             all_labels.extend(labels.cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
-            pbar.set_postfix({"loss": running_loss / max(1, num_batches)})
+
+            avg_loss = running_loss / num_batches
+            pbar.set_postfix({"loss": avg_loss})
+
+            if (i + 1) % log_interval == 0:
+                logger.info(
+                    "    Batch %d/%d | loss %.4f",
+                    i + 1,
+                    total_batches,
+                    avg_loss,
+                )
 
         return self._metrics(running_loss / max(1, len(dataloader)), all_labels, all_preds, all_probs)
 
@@ -155,7 +168,10 @@ class SequencePriorTrainer:
         all_probs = []
 
         pbar = tqdm(dataloader, desc="Validating sequence prior", leave=False)
-        for embeddings, labels in pbar:
+        log_interval = 200
+        total_batches = len(dataloader)
+
+        for i, (embeddings, labels) in enumerate(pbar):
             embeddings = embeddings.to(self.device, non_blocking=True).float()
             labels = labels.to(self.device, non_blocking=True)
 
@@ -167,6 +183,14 @@ class SequencePriorTrainer:
             all_labels.extend(labels.cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
+
+            if (i + 1) % log_interval == 0:
+                logger.info(
+                    "    Val Batch %d/%d | loss %.4f",
+                    i + 1,
+                    total_batches,
+                    running_loss / (i + 1),
+                )
 
         return self._metrics(running_loss / max(1, len(dataloader)), all_labels, all_preds, all_probs)
 
