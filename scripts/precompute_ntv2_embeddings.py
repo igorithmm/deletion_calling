@@ -92,6 +92,19 @@ def load_model(
         pkg.__path__ = [str(model_dir)]
         sys.modules[pkg_name] = pkg
 
+    # Polyfill for find_pruneable_heads_and_indices and prune_linear_layer
+    # which moved around in different versions of the transformers library.
+    import transformers.pytorch_utils as torch_utils
+    if not hasattr(torch_utils, "find_pruneable_heads_and_indices"):
+        try:
+            from transformers import modeling_utils
+            if hasattr(modeling_utils, "find_pruneable_heads_and_indices"):
+                torch_utils.find_pruneable_heads_and_indices = modeling_utils.find_pruneable_heads_and_indices
+                torch_utils.prune_linear_layer = modeling_utils.prune_linear_layer
+                logger.info("Polyfilled find_pruneable_heads_and_indices from modeling_utils")
+        except (ImportError, AttributeError):
+            pass
+
     # Load custom config and model classes
     for module_name in ["esm_config", "modeling_esm"]:
         spec = importlib.util.spec_from_file_location(
