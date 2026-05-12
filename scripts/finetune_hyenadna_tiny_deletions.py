@@ -629,7 +629,7 @@ def main() -> None:
             best_metrics = val_metrics
             best_dir = output_dir / "best_model"
             best_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(best_dir)
+            model.save_pretrained(best_dir, safe_serialization=False)
             tokenizer.save_pretrained(best_dir)
             save_json(
                 best_dir / "training_summary.json",
@@ -643,7 +643,7 @@ def main() -> None:
 
     final_dir = output_dir / "last_model"
     final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_dir)
+    model.save_pretrained(final_dir, safe_serialization=False)
     tokenizer.save_pretrained(final_dir)
     save_json(
         output_dir / "final_metrics.json",
