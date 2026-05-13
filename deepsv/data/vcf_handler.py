@@ -133,17 +133,18 @@ class VCFHandler:
 
         for variant in variants:
             if region_length is None:
-                del_length = variant.length
-                if del_length > 700:
-                    del_length = 4 * del_length // 5  # Cap at 80% of original
+                # Double the anchor length relative to variant length
+                del_length = variant.length * 2
             else:
                 del_length = int(region_length)
 
             if anchor_type == "up":
-                start = max(0, variant.start - del_length - 150)
+                # Buffer reduced from 150 to 50
+                start = max(0, variant.start - del_length - 50)
                 end = start + del_length
             else:  # down anchor
-                start = variant.end + 150
+                # Buffer reduced from 150 to 50
+                start = variant.end + 50
                 end = start + del_length
 
             anchor = Variant(

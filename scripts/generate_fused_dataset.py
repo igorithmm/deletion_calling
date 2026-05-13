@@ -208,6 +208,9 @@ def generate(
     refine_boundaries: bool = True,
     neg_strategy: str = "anchor",
     neg_regional_distance_kb: int = 200,
+    neg_anchor_factor: float = 1.0,
+    neg_regional_factor: float = 1.0,
+    neg_random_factor: float = 1.0,
     neg_random_pool_factor: float = 1.0,
     seed: int = 42,
 ) -> Path:
@@ -339,13 +342,15 @@ def generate(
             else:  # "mixed" — up to N windows per each negative source.
                 target_bp = n_positive_windows * WINDOW_BP
 
+                # 1. Up Anchor
+                target_n_up = int(max(1, n_positive_windows * neg_anchor_factor))
                 up_anchor = vcf.get_non_deletion_regions(
-                    [variant], anchor_type="up", region_length=target_bp
+                    [variant], anchor_type="up", region_length=target_n_up * WINDOW_BP
                 )
                 rows.extend(
                     render_target_windows(
                         up_anchor,
-                        n_positive_windows,
+                        target_n_up,
                         bam,
                         image_gen,
                         nondel_dir,
@@ -353,13 +358,15 @@ def generate(
                     )
                 )
 
+                # 2. Down Anchor
+                target_n_down = int(max(1, n_positive_windows * neg_anchor_factor))
                 down_anchor = vcf.get_non_deletion_regions(
-                    [variant], anchor_type="down", region_length=target_bp
+                    [variant], anchor_type="down", region_length=target_n_down * WINDOW_BP
                 )
                 rows.extend(
                     render_target_windows(
                         down_anchor,
-                        n_positive_windows,
+                        target_n_down,
                         bam,
                         image_gen,
                         nondel_dir,
@@ -367,43 +374,49 @@ def generate(
                     )
                 )
 
-                regional = vcf.sample_regional_negatives(
-                    variant=variant,
-                    all_variants=all_variants,
-                    chrom_lengths=chrom_lengths,
-                    distance_kb=neg_regional_distance_kb,
-                    win_len=target_bp,
-                    rng=rng,
-                )
-                rows.extend(
-                    render_target_windows(
-                        regional,
-                        n_positive_windows,
-                        bam,
-                        image_gen,
-                        nondel_dir,
-                        neg_type="regional",
+                # 3. Regional
+                target_n_reg = int(n_positive_windows * neg_regional_factor)
+                if target_n_reg > 0:
+                    regional = vcf.sample_regional_negatives(
+                        variant=variant,
+                        all_variants=all_variants,
+                        chrom_lengths=chrom_lengths,
+                        distance_kb=neg_regional_distance_kb,
+                        win_len=target_n_reg * WINDOW_BP,
+                        rng=rng,
                     )
-                )
+                    rows.extend(
+                        render_target_windows(
+                            regional,
+                            target_n_reg,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            neg_type="regional",
+                        )
+                    )
 
-                random_candidate_count = max(1, int(4 * neg_random_pool_factor))
-                random_candidates = vcf.sample_random_negatives(
-                    all_variants=all_variants,
-                    chrom_lengths=chrom_lengths,
-                    win_len=target_bp,
-                    n_windows=random_candidate_count,
-                    rng=rng,
-                )
-                rows.extend(
-                    render_target_windows(
-                        random_candidates,
-                        n_positive_windows,
-                        bam,
-                        image_gen,
-                        nondel_dir,
-                        neg_type="random",
+                # 4. Random
+                target_n_rnd = int(n_positive_windows * neg_random_factor)
+                if target_n_rnd > 0:
+                    random_candidate_count = max(1, int(4 * neg_random_pool_factor))
+                    random_candidates = vcf.sample_random_negatives(
+                        all_variants=all_variants,
+                        chrom_lengths=chrom_lengths,
+                        win_len=target_n_rnd * WINDOW_BP,
+                        n_windows=random_candidate_count,
+                        rng=rng,
                     )
-                )
+                    rows.extend(
+                        render_target_windows(
+                            random_candidates,
+                            target_n_rnd,
+                            bam,
+                            image_gen,
+                            nondel_dir,
+                            neg_type="random",
+                        )
+                    )
 
             if i % 25 == 0 or i == len(variants):
                 logger.info(
@@ -512,6 +525,24 @@ def parse_args() -> argparse.Namespace:
         help="Distance (kb) from deletion for Level-2 regional negatives (default: 200).",
     )
     p.add_argument(
+        "--neg-anchor-factor",
+        type=float,
+        default=1.0,
+        help="Ratio of anchor negatives (up/down each) to positive windows (default: 1.0).",
+    )
+    p.add_argument(
+        "--neg-regional-factor",
+        type=float,
+        default=1.0,
+        help="Ratio of regional negatives to positive windows (default: 1.0).",
+    )
+    p.add_argument(
+        "--neg-random-factor",
+        type=float,
+        default=1.0,
+        help="Ratio of random negatives to positive windows (default: 1.0).",
+    )
+    p.add_argument(
         "--neg-random-pool-factor",
         type=float,
         default=1.0,
@@ -540,6 +571,9 @@ def main() -> None:
         refine_boundaries=not args.no_refine,
         neg_strategy=args.neg_strategy,
         neg_regional_distance_kb=args.neg_regional_distance_kb,
+        neg_anchor_factor=args.neg_anchor_factor,
+        neg_regional_factor=args.neg_regional_factor,
+        neg_random_factor=args.neg_random_factor,
         neg_random_pool_factor=args.neg_random_pool_factor,
         seed=args.seed,
     )
